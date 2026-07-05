@@ -5,7 +5,6 @@ use cosmic::widget::{
     text::{title4, heading}, 
     button, 
     text_input,
-    responsive
 };
 use cosmic::Element;
 use uuid::Uuid;

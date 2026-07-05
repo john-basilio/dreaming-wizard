@@ -1,6 +1,8 @@
 # Dreaming Wizard
 
-A narrative storytelling tool.
+Dreaming Wizard (also called D-wiz) is a narrative authoring tool inspired by [Twine](https://twinery.org/).
+
+While the Twine's functions are mostly for pure narrative, Dreaming Wizard aims to provide more support in authoring narrative stories on the context of game development, rather than just pure storytelling.
 
 ## Installation
 
