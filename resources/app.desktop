@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Dreaming Wizard
+Comment=A narrative storytelling tool.
+Type=Application
+Icon=com.github.john-basilio.DreamingWizard
+Exec=dreaming-wizard %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC
+Keywords=COSMIC
+MimeType=
