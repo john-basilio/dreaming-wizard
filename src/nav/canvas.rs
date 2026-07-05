@@ -11,7 +11,9 @@ use cosmic::iced::{Border, Background, Size};
 use crate::components::{
     StoryNode, 
     StoryNodeEditor, 
-    story_node_editor::{EditorEvent, EditorMessage},};
+    story_node_editor::{EditorEvent, EditorMessage},
+    display_title,
+};
 
 /// Responsible for providing unique UUIDs for each node
 /// so that they can be identified by other components.
@@ -92,7 +94,7 @@ impl CanvasPage {
 
                 let node_widget = pin(
                     widget::container(
-                        widget::text::body(node.display_title())
+                        widget::text::body(display_title(&node.title, 15))
                             .width(Length::Fill)
                             .align_x(cosmic::iced::alignment::Horizontal::Center)
                     )

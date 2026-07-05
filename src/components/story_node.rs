@@ -10,7 +10,6 @@ use cosmic::widget::{
     canvas::{self,Frame, Path, Stroke}
 };
 
-
 #[derive(Debug, Clone)]
 pub struct StoryNode {
     pub id: Uuid,
@@ -31,13 +30,6 @@ impl Default for StoryNode {
 }
 
 impl StoryNode {
-
-    const FONT_SIZE: f32 = 16.0;
-    const TEXT_PADDING: f32 = 12.0;
-    // Rough average glyph width for a typical UI sans-serif font, as a
-    // fraction of font size — an estimate, not a real measurement.
-    // See `truncate()` for why.
-    const AVG_CHAR_WIDTH_RATIO: f32 = 0.55;
 
     #[allow(dead_code)]
     pub fn new(id: Uuid, position: Point, size: Size, title: impl Into<String>) -> Self {
@@ -65,31 +57,4 @@ impl StoryNode {
         );        
     }
 
-    pub fn display_title(&self) -> String {
-        let available = (self.size.width - Self::TEXT_PADDING * 2.0).max(0.0);
-        Self::truncate(&self.title, available)
-    }
-
-
-    fn truncate(title: &str, available_width: f32) -> String {
-        let avg_char_width = Self::FONT_SIZE * Self::AVG_CHAR_WIDTH_RATIO;
-        if avg_char_width <= 0.0 {
-            return String::new();
-        }
-
-        let max_chars = (available_width / avg_char_width).floor() as usize;
-        let char_count = title.chars().count();
-
-        if char_count <= max_chars {
-            return title.to_string();
-        }
-        if max_chars == 0 {
-            return String::new();
-        }
-
-        let keep = max_chars.saturating_sub(1);
-        let mut truncated: String = title.chars().take(keep).collect();
-        truncated.push('…');
-        truncated
-    }
 }

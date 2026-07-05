@@ -4,11 +4,13 @@ use cosmic::widget::{
     Row, 
     text::{title4, heading}, 
     button, 
-    text_input};
+    text_input,
+    responsive
+};
 use cosmic::Element;
 use uuid::Uuid;
-
 use crate::fl;
+use super::display_title;
 
 /// A side panel for editing a single `StoryNode`'s title.
 ///
@@ -49,15 +51,23 @@ impl StoryNodeEditor {
     }
 
     pub fn view(&self) -> Element<'_, EditorMessage> {
+
         Column::new()
             // The editor label and the close button
             // TODO: Decide whether to implement some widgets in this row in the future
             .push(
                 Row::new()
-                .push(title4(fl!("editor-label")  + " " + self.draft_title.as_str()).width(Length::Fill))
-                .push(button::text(fl!("editor-close")).on_press(EditorMessage::Close))
-                .spacing(10)
-                .align_y(Alignment::Center)
+                        .push(
+                            title4(format!("{} {}", fl!("editor-label"), display_title(&self.draft_title, 30)))
+                                .width(Length::Fill)
+                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                        )
+                        .push(
+                            button::text(fl!("editor-close"))
+                                .on_press(EditorMessage::Close)
+                        )
+                        .spacing(10)
+                        .align_y(Alignment::Center)
             )
             .push(
                 Row::new()
