@@ -7,6 +7,6 @@ pub fn display_title(s: &str, char_limit: usize) -> String {
         s.to_string()
     } else {
         let truncated: String = s.chars().take(char_limit -1).collect();
-        format!("{}...", truncated)
+        format!("{truncated}...")
     }
 }

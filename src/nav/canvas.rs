@@ -1,4 +1,5 @@
-
+#![allow(clippy::cast_precision_loss)] // Precision loss from i32 to f32 conversion is practically harmless for normal use.
+#![allow(clippy::cast_possible_truncation)] // Same case for f32 to i32
 use std::cell::Cell;
 use cosmic::{
     Element, Renderer, Theme, iced::{
@@ -160,18 +161,19 @@ impl CanvasPage {
             },
             CanvasMessage::NodeDragged { id, delta } => {
                 // You have to check the Option<> first before you can iterate
-                if let Some(nodes) = &mut self.nodes {
-                    if let Some(node) = nodes.iter_mut().find(|node| node.id == id) {
-                        node.position += delta;
-                }}
+                if let Some(nodes) = &mut self.nodes 
+                    && let Some(node) = nodes.iter_mut().find(|node| node.id == id)
+                {
+                    node.position += delta;
+                }
                 self.geo_cache.clear();
                 None
             },
             CanvasMessage::NodeClicked { id } => {
-                if let Some(nodes) = &mut self.nodes {
-                    if let Some(node) = nodes.iter().find(|n| n.id == id) {
-                        self.editor = Some(StoryNodeEditor::new(id, node.title.clone()))
-                    }
+                if let Some(nodes) = &mut self.nodes 
+                    && let Some(node) = nodes.iter().find(|n| n.id == id)
+                {
+                    self.editor = Some(StoryNodeEditor::new(id, node.title.clone()));
                 }
 
                 Some(id)
@@ -208,10 +210,10 @@ impl CanvasPage {
                 match event {
                     EditorEvent::None => {}
                     EditorEvent::TitleCommitted(new_title) => {
-                        if let Some(nodes) = &mut self.nodes {
-                            if let Some(node) = nodes.iter_mut().find(|n| n.id == node_id) {
-                                node.title = new_title;
-                            }
+                        if let Some(nodes) = &mut self.nodes
+                            && let Some(node) = nodes.iter_mut().find(|n| n.id == node_id)
+                        {
+                            node.title = new_title;
                         }
 
                         self.geo_cache.clear();

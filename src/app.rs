@@ -36,7 +36,7 @@ pub struct AppModel {
     pub nav: nav_bar::Model,
     /// Key bindings for the application's menu bar.
     pub key_binds: HashMap<menu::KeyBind, MenuAction>,
-    /// Contains ContextDrawer pages
+    /// Contains `ContextDrawer` pages
     pub drawer_page: DrawerPage,
 }
 
