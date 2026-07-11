@@ -5,9 +5,13 @@ git-description = Git commit {$hash} on {$date}
 ## Header Start
 
 # Header Start menus
+hs_file = File
 hs_help = Help
 hs_canvas = Canvas
 
+# Header Start: File
+item_save = Save
+item_load = Load
 
 # Header Start: Help
 item_about = About

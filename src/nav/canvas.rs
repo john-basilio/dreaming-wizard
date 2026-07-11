@@ -1,9 +1,9 @@
 #![allow(clippy::cast_precision_loss)] // Precision loss from i32 to f32 conversion is practically harmless for normal use.
 #![allow(clippy::cast_possible_truncation)] // Same case for f32 to i32
 
-/// This page is responsible for visualizing nodes, aka StoryNodes
-/// as well as letting the users modify them in place through the 
-/// editor interface when a node is clicked.
+//! This page is responsible for visualizing nodes, aka `StoryNodes`
+//! as well as letting the users modify them in place through the 
+//! editor interface when a node is clicked.
 
 use std::cell::Cell;
 use cosmic::{
@@ -19,7 +19,6 @@ use crate::components::{
     StoryNode, 
     StoryNodeEditor, 
     display_title, 
-    project_data::CanvasData, 
     story_node_editor::{EditorEvent, EditorMessage},
 };
 

@@ -9,5 +9,3 @@ pub use dev_helper_fn::{display_title};
 
 pub mod project_data;
 pub use project_data::ProjectData;
-
-pub mod dev_serializer;
