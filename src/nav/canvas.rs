@@ -1,5 +1,10 @@
 #![allow(clippy::cast_precision_loss)] // Precision loss from i32 to f32 conversion is practically harmless for normal use.
 #![allow(clippy::cast_possible_truncation)] // Same case for f32 to i32
+
+/// This page is responsible for visualizing nodes, aka StoryNodes
+/// as well as letting the users modify them in place through the 
+/// editor interface when a node is clicked.
+
 use std::cell::Cell;
 use cosmic::{
     Element, Renderer, Theme, iced::{
@@ -10,10 +15,12 @@ use cosmic::{
 use cosmic::iced::{Border, Background, Size};
 
 use crate::components::{
+    NodePosition, 
     StoryNode, 
     StoryNodeEditor, 
+    display_title, 
+    project_data::CanvasData, 
     story_node_editor::{EditorEvent, EditorMessage},
-    display_title,
 };
 
 /// Responsible for providing unique UUIDs for each node
@@ -32,8 +39,8 @@ pub struct CanvasPage {
     pub last_bounds: Cell<Size>, // updated every draw(), read by update() for world_center()
 
     // view() unique fields
-    pub nodes: Option<Vec<StoryNode>>,
     pub editor: Option<StoryNodeEditor>,
+    pub nodes: Vec<StoryNode>, 
 }
 
 /// Messages emitted by the canvas page. 
@@ -62,8 +69,8 @@ impl Default for CanvasPage {
             geo_cache: canvas::Cache::new(),
             zoom: 1.0, // Needs to be at least 1.0 to avoid division of 0.
             offset: Vector::new(0.0, 0.0),
-            nodes: Some(vec![StoryNode::default()]), // temporary, default NONE,
             editor: None,
+            nodes: Vec::new(),
             last_bounds: Cell::new(Size::new(800.0, 600.0)), // fallback before first draw
         }
     }
@@ -79,17 +86,16 @@ impl CanvasPage {
     pub fn view(&self) -> Element<'_, CanvasMessage> {
         use cosmic::iced::widget::{Stack, pin};
 
-
         let canvas_element = widget::canvas(self)
             .width(Length::Fill)
             .height(Length::Fill);
 
-        let nodes = self.nodes.as_deref().unwrap_or(&[]);
-
-        let stack = nodes.iter().fold(
+        // Stack indirectly helps with occlusion by stacking nodes in order of first-bottom to last-top.
+        let stack = self.nodes.iter().fold(
             Stack::new().push(canvas_element),
             |stack, node| {
-                let screen = self.world_to_screen(node.position);
+                let screen = self.world_to_screen(
+                    Point::new(node.position.x, node.position.y));
                 let screen_width = node.size.width * self.zoom;
                 let screen_height = node.size.height * self.zoom;
 
@@ -98,6 +104,7 @@ impl CanvasPage {
                         widget::text::body(display_title(&node.title, 15))
                             .width(Length::Fill)
                             .align_x(cosmic::iced::alignment::Horizontal::Center)
+                            .size(14.0 * self.zoom) // The `14` comes from: /libcosmic-41009aea1d72760b/e7f278d/src/widget/text.rs -> pub fn heading
                     )
                     .width(Length::Fixed(screen_width))
                     .height(Length::Fixed(screen_height))
@@ -117,8 +124,7 @@ impl CanvasPage {
 
                 stack.push(node_widget)
             }
-        )
-        .clip(true);
+        ).clip(true);
 
 
         // Now we return the stack with the canvas and all the nodes.
@@ -144,13 +150,13 @@ impl CanvasPage {
                 let center = self.world_center();
                 let default_node = StoryNode::default();
 
-                let top_left = Point::new(
-                    center.x - default_node.size.width / 2.0,
-                    center.y - default_node.size.height / 2.0,
-                );
+                let top_left = NodePosition {
+                    x: center.x - default_node.size.width / 2.0,
+                    y: center.y - default_node.size.height / 2.0,
+                };
 
                 let node = StoryNode { position: top_left, ..default_node };
-                self.nodes.get_or_insert_with(Vec::new).push(node);
+                self.nodes.push(node);
                 self.geo_cache.clear();
                 None
             },
@@ -160,22 +166,17 @@ impl CanvasPage {
                 None
             },
             CanvasMessage::NodeDragged { id, delta } => {
-                // You have to check the Option<> first before you can iterate
-                if let Some(nodes) = &mut self.nodes 
-                    && let Some(node) = nodes.iter_mut().find(|node| node.id == id)
-                {
-                    node.position += delta;
+                if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
+                    node.position.x += delta.x;
+                    node.position.y += delta.y;
                 }
                 self.geo_cache.clear();
                 None
             },
             CanvasMessage::NodeClicked { id } => {
-                if let Some(nodes) = &mut self.nodes 
-                    && let Some(node) = nodes.iter().find(|n| n.id == id)
-                {
+                if let Some(node) = self.nodes.iter().find(|n| n.id == id) {
                     self.editor = Some(StoryNodeEditor::new(id, node.title.clone()));
                 }
-
                 Some(id)
             }
 
@@ -210,9 +211,7 @@ impl CanvasPage {
                 match event {
                     EditorEvent::None => {}
                     EditorEvent::TitleCommitted(new_title) => {
-                        if let Some(nodes) = &mut self.nodes
-                            && let Some(node) = nodes.iter_mut().find(|n| n.id == node_id)
-                        {
+                        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
                             node.title = new_title;
                         }
 
@@ -291,7 +290,7 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let world_position = self.screen_to_world(cursor_position);
 
-                if let Some(node) = self.nodes.as_deref().unwrap_or(&[]).iter().rev().find(|n| n.contains(world_position)) {
+                if let Some(node) = self.nodes.iter().rev().find(|n| n.contains(world_position)) {
                     *state = CanvasInteraction::DraggingNode {
                         id: node.id,
                         last: cursor_position,
@@ -388,22 +387,27 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
         vec![self.geo_cache.draw(renderer, bounds.size(), |frame: &mut canvas::Frame| {
             // Apply the current offset to the frame before drawing the grid.
             frame.translate(self.offset);
+
             // Must be applied AFTER translation, otherwise the grid will not scale correctly.
             frame.scale(self.zoom);
+
             // Grid settings
             let grid_color = Color::from_rgb8(46, 46, 46);
             let grid_width = 1.0;
+
             //  Adaptive grid to zoom and spacing settings
             let base_spacing = 50.0;
             let level = self.zoom.log2().floor();
             let scale = 2.0_f32.powf(level);
             let spacing = base_spacing / scale;
+
             // Calculate world coordinates for visible area.
             // screen = world * zoom + offset  =>  world = (screen - offset) / zoom
             let world_min_x = -self.offset.x / self.zoom;
             let world_min_y = -self.offset.y / self.zoom;
             let world_max_x = (bounds.width - self.offset.x) / self.zoom;
             let world_max_y = (bounds.height - self.offset.y) / self.zoom;
+
             // Colums and Rows calculation to evenly render grid lines.
             // floor/ceil + 1 cell of padding so dots don't visibly pop in
             // right at the screen edge as you pan.
@@ -446,7 +450,7 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
                 );
             }
 
-            for node in self.nodes.as_deref().unwrap_or(&[]) {
+            for node in &self.nodes {
                 node.draw(frame); // no text, just the rounded rectangle
             }
         })]

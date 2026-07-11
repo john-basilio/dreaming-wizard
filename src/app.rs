@@ -5,10 +5,6 @@
 // use crate::config::Config;
 // use cosmic::cosmic_config::{self, CosmicConfigEntry};
 
-
-// TODO: to answer later: based on the story_node_editor.rs which practically 
-// functions the same, can it be ported into context drawer too? yes 
-// or no only
 use crate::nav::{CanvasPage, CanvasMessage};
 use crate::fl;
 use cosmic::app::context_drawer;
@@ -19,18 +15,20 @@ use cosmic::widget::{self, about::About, icon, menu, nav_bar};
 use cosmic::Element;
 use std::collections::HashMap;
 
+use crate::components::project_data::ProjectData;
+
+
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] = include_bytes!("../resources/icons/hicolor/scalable/apps/icon.svg");
 
-/// The application model stores app-specific state used to describe its interface and
-/// drive its logic.
+
+/// The application model stores app-specific state used to describe its
+/// interface and drive its logic.
 pub struct AppModel {
     /// Application state which is managed by the COSMIC runtime.
     pub core: cosmic::Core,
-    /// Canvas Page
-    pub canvas: CanvasPage,
-    /// The about page for this app.
+    /// The about context for this app.
     pub about: About,
     /// Contains items assigned to the nav bar panel.
     pub nav: nav_bar::Model,
@@ -38,6 +36,10 @@ pub struct AppModel {
     pub key_binds: HashMap<menu::KeyBind, MenuAction>,
     /// Contains `ContextDrawer` pages
     pub drawer_page: DrawerPage,
+
+    /// Canvas Page
+    pub canvas: CanvasPage,
+
 }
 
 pub enum DrawerPage {
@@ -59,10 +61,11 @@ pub enum Message {
     HeaderHelp(HelpMenuAction),
     // Nav pages
     Canvas(CanvasMessage),
+    // Characters,
     
     // Direct Actions
     CloseDrawer,
-    // To do: Unknown yet
+    // TODO: Unknown yet
     LaunchUrl(String),
 }
 
