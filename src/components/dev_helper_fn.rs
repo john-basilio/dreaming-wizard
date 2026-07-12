@@ -1,5 +1,8 @@
-// This module is simply a pool for shared helper functions
+//! This module is simply a pool for shared helper functions.
 
+/// Truncates `s` to at most `char_limit` characters, appending `...` when it
+/// had to cut anything. Used anywhere a `StoryNode` title is rendered in a
+/// tight space (the on-canvas node label, the editor's header).
 pub fn display_title(s: &str, char_limit: usize) -> String {
     let count = s.chars().count();
 

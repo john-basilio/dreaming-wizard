@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Not used for now, removed related stuff that can be added later
-// may copy from libcosmic template later
-// use crate::config::Config;
-// use cosmic::cosmic_config::{self, CosmicConfigEntry};
+//! The application shell: window/header/nav-bar chrome, the top-level
+//! `Message`/`update`/`view` loop, global keybind dispatch, and JSON
+//! project save/load. The actual story canvas lives in `nav::canvas`;
+//! this file mostly wires COSMIC's `Application` trait to it.
 
-use crate::nav::{CanvasPage, CanvasMessage};
+use crate::config::Config;
+use cosmic::cosmic_config::{self, CosmicConfigEntry};
+
 use crate::fl;
 use cosmic::{
     prelude::*,
@@ -15,21 +17,35 @@ use cosmic::{
         self, 
         about::About, 
         icon, 
-        menu::{self,key_bind::{KeyBind,Modifier}}, 
-        nav_bar
+        menu::{self,key_bind::{KeyBind,Modifier},action::MenuAction as _,ItemWidth},
+        nav_bar,
+        text,
     },
     iced::{
+        Subscription,
         Length,
-        keyboard::Key,
-        alignment::{Horizontal, Vertical}},
+        Vector,
+        event::{self, Event},
+        keyboard::{self, Key, Modifiers, key::Physical},
+        alignment::{Horizontal, Vertical},
+        advanced::text::{Wrapping, Ellipsize, EllipsizeHeightLimit},
+    },
 
 };
+
 use std::{
     collections::HashMap,
     io::BufWriter,
     fs::File,
 };
-use crate::components::ProjectData;
+
+use crate::nav::{
+    CanvasPage, CanvasMessage,
+};
+
+use crate::components::{
+    ProjectFile, ProjectData,
+};
 
 
 
@@ -50,12 +66,25 @@ pub struct AppModel {
     pub key_binds: HashMap<menu::KeyBind, MenuAction>,
     /// Contains `ContextDrawer` pages
     pub drawer_page: DrawerPage,
+    /// Configuration data that persists between application runs.
+    config: Config,
+    /// The `cosmic_config` handle backing `config`; `None` if it couldn't be
+    /// opened (e.g. no writable config dir), in which case `config` changes
+    /// still apply in-memory but silently aren't persisted. Kept separate
+    /// from `config` because `write_entry` needs this handle, not the data.
+    config_handle: Option<cosmic_config::Config>,
+
+    /// Project metadata
+    project_meta: ProjectData,
 
     /// Canvas Page
     pub canvas: CanvasPage,
 
+
+
 }
 
+/// Which page (if any) `AppModel::context_drawer` should currently show.
 pub enum DrawerPage {
     None,
     About,
@@ -80,15 +109,18 @@ pub enum Message {
     
     // Direct Actions
     CloseDrawer,
-    // TODO: Unknown yet
+    // Opens a URL in the system's default handler; currently only reached
+    // from links clicked inside the About context drawer.
     LaunchUrl(String),
+    // Raw key presses, matched against `AppModel::key_binds`.
+    Key(Modifiers, Key, Physical),
 }
 
 /// For future purposes, we're expecting interactions to be often with 
 /// header menus, so each menu are their own enum.
 // TODO: Complete the implementation of the header menu
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-// Canvas menu
+// File menu
 pub enum FileMenuAction {
     Load,
     Save,
@@ -149,6 +181,46 @@ impl AppModel {
             self.set_window_title(window_title, id)
         } else {
             Task::none()
+        }
+    }
+
+    /// The project file path Save/Load should use: the last remembered one,
+    /// or a fixed fallback location if none is set yet.
+    fn project_path(&self) -> std::path::PathBuf {
+        self.config.last_project_path.as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| dirs::download_dir().unwrap().join("dw.json"))
+    }
+
+    /// Reads and applies a project file from `path` onto canvas/metadata
+    /// state. Returns whether it succeeded (missing file, unreadable, or
+    /// invalid JSON all just report `false` rather than panicking) — on
+    /// failure this leaves existing state untouched, so callers decide what
+    /// "new session" fallback means for their context.
+    fn try_load_project(&mut self, path: &std::path::Path) -> bool {
+        let Some(project) = std::fs::read_to_string(path).ok()
+            .and_then(|json| serde_json::from_str::<ProjectFile>(&json).ok())
+        else {
+            return false;
+        };
+
+        self.canvas.nodes = project.canvas.nodes;
+        self.canvas.geo_cache.clear();
+        self.project_meta = project.metadata;
+        self.canvas.offset = Vector::new(
+            project.canvas.last_camera.0,
+            project.canvas.last_camera.1,
+        );
+
+        true
+    }
+
+    /// Persists `self.config` to disk. Silently does nothing if the config
+    /// handle couldn't be opened at startup (see `AppModel::config_handle`).
+    fn save_config(&self) {
+        if let Some(context) = &self.config_handle
+            && let Err(err) = self.config.write_entry(context) {
+            eprintln!("failed to write config: {err}");
         }
     }
 }
@@ -225,15 +297,58 @@ impl cosmic::Application for AppModel {
             .license(env!("CARGO_PKG_LICENSE"));
             
 
+        // Open the cosmic_config handle once so we can both read the initial
+        // config and write updates back to it later (`write_entry` needs
+        // the handle itself, not just the deserialized `Config`).
+        let config_handle = cosmic_config::Config::new(Self::APP_ID, Config::VERSION).ok();
+        let config = config_handle.as_ref()
+            .map(|context| match Config::get_entry(context) {
+                Ok(config) => config,
+                Err((_errors, config)) => {
+                    // for why in errors {
+                    //     tracing::error!(%why, "error loading app config");
+                    // }
+
+                    config
+                }
+            })
+            .unwrap_or_default();
+
         // Construct the app model with the runtime's core.
         let mut app = AppModel {
             core,
             canvas: CanvasPage::default(),
             about,
             nav,
-            key_binds: HashMap::new(),
+            key_binds,
             drawer_page: DrawerPage::None,
+            project_meta: ProjectData::default(),
+            config,
+            config_handle,
         };
+
+        // Auto-load the last remembered project, if any. Only attempt this
+        // when a path was actually remembered — an absent path means "no
+        // prior session," not "try the fallback location," so a fresh
+        // install doesn't pick up an unrelated leftover file there.
+        if let Some(path) = app.config.last_project_path.clone() {
+            let path = std::path::PathBuf::from(path);
+
+            if app.try_load_project(&path) {
+                println!("Loaded from {}", path.display());
+            } else {
+                // `app.canvas`/`app.project_meta` are already fresh defaults
+                // from the struct literal above, so there's nothing to
+                // reset here beyond forgetting the bad path.
+                app.config.last_project_path = None;
+                app.save_config();
+
+                eprintln!(
+                    "Could not load remembered project from {}; starting a new session.",
+                    path.display()
+                );
+            }
+        }
 
         // Create a startup command that sets the window title.
         let command = app.update_title();
@@ -253,8 +368,8 @@ impl cosmic::Application for AppModel {
                         None, 
                         MenuAction::File(FileMenuAction::Load)),
                     menu::Item::Button(
-                        fl!("item_save"), 
-                        None, 
+                        fl!("item_save"),
+                        None,
                         MenuAction::File(FileMenuAction::Save))
                 ]
             ),
@@ -272,7 +387,10 @@ impl cosmic::Application for AppModel {
                     )
                 ]
             )
-        )]);
+        )])
+        // "New Story Node" is the longest label in any of our menus, so it
+        // keeps the widest item width to fit alongside its "Ctrl + A" hint.
+        .item_width(ItemWidth::Uniform(200));
 
         let help_menu = menu::bar(vec![menu::Tree::with_children(
             menu::root(fl!("hs_help")).apply(Element::from),
@@ -284,14 +402,79 @@ impl cosmic::Application for AppModel {
                         None, 
                         MenuAction::Help(HelpMenuAction::About))],
             ),
-        )]);
+        )])
+        // "About" has no keybind hint at all, so it only needs to fit the label.
+        .item_width(ItemWidth::Uniform(160));
 
         vec![file_menu.into(), canvas_menu.into(), help_menu.into()]
+    }
+
+    fn header_center(&self) -> Vec<Element<'_, Self::Message>> {
+        // Update `Header Title` with file's project name or "New Project".
+
+        let display_name = if self.project_meta.name.is_empty() {
+            "New Project"
+        } else {
+            &self.project_meta.name
+        };
+
+        let title = text::heading(format!(
+            "{} {}", fl!("project_title_prefix"), display_name
+        ))
+            .width(Length::Fill)
+            .center()
+            .wrapping(Wrapping::None)
+            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)));
+
+        let title = widget::container(title)
+            .width(Length::Fill)
+            .padding([0, 64]);
+
+        vec![title.into()]
     }
 
     /// Enables the COSMIC application to create a nav bar with this model.
     fn nav_model(&self) -> Option<&nav_bar::Model> {
         Some(&self.nav)
+    }
+
+    /// Builds the nav bar, sized to hug its widest item instead of always
+    /// taking the default fixed width.
+    fn nav_bar(&self) -> Option<Element<'_, cosmic::Action<Self::Message>>> {
+        if !self.core.nav_bar_active() {
+            return None;
+        }
+
+        let nav_model = self.nav_model()?;
+
+        let theme = cosmic::theme::active();
+        let space_xxs = theme.cosmic().space_xxs();
+        let space_s = theme.cosmic().space_s();
+        let space_l = theme.cosmic().space_l();
+
+        // Ideally this would match the width of the nav's shortest item, but
+        // that requires measuring shaped text against a live renderer, which
+        // isn't available while just building the widget tree. `space_l`
+        // gives comfortable, deliberate breathing room instead.
+        let nav = cosmic::widget::segmented_button::vertical(nav_model)
+            .on_activate(|id| cosmic::Action::Cosmic(cosmic::app::Action::NavBar(id)))
+            .button_height(32)
+            .button_padding([space_l, space_xxs, space_l, space_xxs])
+            .button_spacing(space_xxs)
+            .spacing(space_xxs)
+            .style(cosmic::theme::SegmentedButton::NavBar)
+            .width(Length::Shrink)
+            .apply(widget::container)
+            .padding(space_s)
+            .apply(widget::scrollable)
+            .class(cosmic::style::iced::Scrollable::Minimal)
+            .height(Length::Fill)
+            .apply(widget::container)
+            .width(Length::Shrink)
+            .height(Length::Fill)
+            .class(cosmic::theme::Container::custom(nav_bar::nav_bar_style));
+
+        Some(Element::from(nav))
     }
 
     /// Display a context drawer if the context page is requested.
@@ -341,31 +524,79 @@ impl cosmic::Application for AppModel {
             // Header Start Messages
             Message::HeaderFile(file_intent) => { match file_intent {
                 FileMenuAction::Load => {
-                    let path = dirs::download_dir().unwrap().join("dw.json");
-                    let json =  std::fs::read_to_string(&path).expect("Failed to read file.");
-                    // Use ProjecData as deserialization shape.
-                    let project: ProjectData = serde_json::from_str(&json).expect("Failed to deserialize.");
-                    
-                    self.canvas.nodes = project.canvas.nodes;
-                    self.canvas.geo_cache.clear();
+                    let path = self.project_path();
 
-                    println!("Loaded from {}", path.display());
+                    // Any failure here (missing file, unreadable, corrupt
+                    // JSON) falls back to a fresh session instead of the
+                    // `.expect()` panics this used to have — and forgets the
+                    // bad remembered path so we don't keep retrying it.
+                    if self.try_load_project(&path) {
+                        self.config.last_project_path = Some(path.display().to_string());
+                        self.save_config();
+
+                        println!("Loaded from {}", path.display());
+                    } else {
+                        self.canvas = CanvasPage::default();
+                        self.project_meta = ProjectData::default();
+
+                        self.config.last_project_path = None;
+                        self.save_config();
+
+                        eprintln!(
+                            "Could not load project from {}; starting a new session.",
+                            path.display()
+                        );
+                    }
                 },
 
                 FileMenuAction::Save => {
-                    let project = ProjectData::new(
+                    let now = jiff::Timestamp::now().to_string();
+
+                    if self.project_meta.created_at.is_empty() {
+                        self.project_meta.created_at = now.clone();
+                    }
+                    self.project_meta.updated_at = now;
+                    self.project_meta.app_version = env!("CARGO_PKG_VERSION").to_string();
+
+                    // No UI yet to set these, so default them until project settings exist.
+                    if self.project_meta.name.is_empty() {
+                        self.project_meta.name = "Unknown".to_string();
+                    }
+                    if self.project_meta.author.is_empty() {
+                        self.project_meta.author = "Unknown".to_string();
+                    }
+
+                    let project = ProjectFile::new(
                         self.canvas.nodes.clone(),
+                        (self.canvas.offset.x, self.canvas.offset.y),
+                        self.project_meta.clone(),
                     );
 
-                    let path = dirs::download_dir().unwrap().join("dw.json");
-                    let file = File::create(&path).expect("Failed to create savefile.");
-                    let writer =  BufWriter::new(file);
+                    let path = self.project_path();
 
-                    serde_json::to_writer_pretty(writer, &project).expect("failed to serialize");
-                    println!("Saved to {}", path.display());
+                    match File::create(&path) {
+                        Ok(file) => {
+                            let writer = BufWriter::new(file);
+
+                            match serde_json::to_writer_pretty(writer, &project) {
+                                Ok(()) => {
+                                    self.config.last_project_path = Some(path.display().to_string());
+                                    self.save_config();
+
+                                    println!("Saved to {}", path.display());
+                                }
+                                Err(err) => {
+                                    eprintln!("failed to serialize project to {}: {err}", path.display());
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("failed to create savefile at {}: {err}", path.display());
+                        }
+                    }
                 },
 
-                
+
             }}
             Message::HeaderCanvas(canvas_intent) => { match canvas_intent {
                 CanvasMenuAction::AddNode => {
@@ -399,14 +630,51 @@ impl cosmic::Application for AppModel {
                     eprintln!("failed to open {url:?}: {err}");
                 }
             },
+
+            Message::Key(modifiers, key, physical_key) => {
+                for (key_bind, action) in &self.key_binds {
+                    if key_bind.matches(modifiers, &key, Some(&physical_key)) {
+                        return self.update(action.message());
+                    }
+                }
+            }
         }
         Task::none()
     }
 
-    // TODO: Keybinds subscription for keyboard shortcuts
-    // fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
-        
-    // }
+    /// Register subscriptions for this application.
+    ///
+    /// Subscriptions are long-running async tasks running in the background which
+    /// emit messages to the application through a channel. They can be dynamically
+    /// stopped and started conditionally based on application state, or persist
+    /// indefinitely.
+    fn subscription(&self) -> Subscription<Self::Message> {
+        let mut subscriptions = vec![
+            event::listen_with(|event, status, _window| {
+                if status != event::Status::Ignored {
+                    return None;
+                }
+
+                match event {
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key, modifiers, physical_key, ..
+                    }) => Some(Message::Key(modifiers, key, physical_key)),
+                    _ => None,
+                }
+            }),
+        ];
+
+        // Only tick while a click-to-edit camera animation is in flight, so
+        // we're not redrawing every frame the rest of the time.
+        if self.canvas.is_animating_camera() {
+            subscriptions.push(
+                cosmic::iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| Message::Canvas(CanvasMessage::AnimationTick)),
+            );
+        }
+
+        Subscription::batch(subscriptions)
+    }
 
     /// Called when a nav item is selected.
     fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<cosmic::Action<Self::Message>> {

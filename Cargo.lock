@@ -1234,6 +1234,7 @@ dependencies = [
  "futures",
  "i18n-embed",
  "i18n-embed-fl",
+ "jiff",
  "libcosmic",
  "open",
  "rust-embed",

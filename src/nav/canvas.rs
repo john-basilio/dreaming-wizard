@@ -6,9 +6,11 @@
 //! editor interface when a node is clicked.
 
 use std::cell::Cell;
+use std::time::{Duration, Instant};
 use cosmic::{
     Element, Renderer, Theme, iced::{
-        Color, Length, Point, Radius, Rectangle, Vector, mouse
+        Color, Length, Point, Radius, Rectangle, Vector, mouse,
+        keyboard::{self, Modifiers},
     }, widget::{self, canvas},
 };
 // use cosmic::theme::Container as ContainerStyle;
@@ -26,38 +28,66 @@ use crate::components::{
 /// so that they can be identified by other components.
 use uuid::Uuid;
 
+/// An in-flight transition of `offset`/`zoom` from one camera state to
+/// another, driven forward by repeated `CanvasMessage::AnimationTick`
+/// messages while it is `Some`.
+pub struct CameraAnimation {
+    start: Instant,
+    duration: Duration,
+    start_offset: Vector,
+    start_zoom: f32,
+    target_offset: Vector,
+    target_zoom: f32,
+}
+
 /// This page model, responsible for rendering the canvas,
 /// where all the story node lives and are rendered.
 pub struct CanvasPage {
     // shared fields — used by both draw() and view()
-    pub offset: Vector,
-    pub zoom: f32,
+    pub offset: Vector, // Camera position: screen = world * zoom + offset.
+    pub zoom: f32, // Camera zoom factor; see MIN_ZOOM/MAX_ZOOM.
 
     // draw() unique fields
     pub geo_cache: canvas::Cache,
     pub last_bounds: Cell<Size>, // updated every draw(), read by update() for world_center()
 
     // view() unique fields
-    pub editor: Option<StoryNodeEditor>,
-    pub nodes: Vec<StoryNode>, 
+    pub editor: Option<StoryNodeEditor>, // Some while a node's editor is open; freezes the canvas (see canvas::Program::update).
+    pub nodes: Vec<StoryNode>, // Every node currently on the canvas.
+
+    // camera animation fields
+    camera_anim: Option<CameraAnimation>,
+    saved_camera: Option<(Vector, f32)>, // (offset, zoom) from before the editor opened
 }
 
-/// Messages emitted by the canvas page. 
+/// Messages emitted by the canvas page.
 #[derive(Debug, Clone)]
 
 pub enum CanvasMessage {
+    /// Spawns a new default-sized `StoryNode` centered in the current view.
     AddNode,
+    /// The camera was dragged by `delta` screen pixels (middle-click or
+    /// Ctrl+left-click drag — see `canvas::Program::update`).
     Panned(Vector),
+    /// Mouse wheel/trackpad scroll over the canvas, zooming around `at`.
     Zoomed {
         at: Point,
         scroll_amount: f32,
     },
-    NodeDragged { 
+    /// A node was moved by `delta` *world*-space units while being dragged.
+    NodeDragged {
         id: Uuid,
         delta: Vector,
     },
+    /// A node was pressed and released without much movement — opens (or
+    /// re-targets) the editor for it and kicks off the click-to-edit camera
+    /// animation.
     NodeClicked {id: Uuid},
+    /// Forwarded from the open `StoryNodeEditor`'s own `view()`.
     Editor(EditorMessage),
+    /// One frame of an in-flight `CameraAnimation`; see `is_animating_camera`
+    /// and `AppModel::subscription` for how these get scheduled.
+    AnimationTick,
 
 }
 
@@ -71,16 +101,36 @@ impl Default for CanvasPage {
             editor: None,
             nodes: Vec::new(),
             last_bounds: Cell::new(Size::new(800.0, 600.0)), // fallback before first draw
+            camera_anim: None,
+            saved_camera: None,
         }
     }
 }
 
 
-/// This is where we put other custom methods. 
+/// This is where we put other custom methods — `view`/`update` for the
+/// COSMIC widget tree, plus the camera math (`screen_to_world` and friends)
+/// shared by both `view` and the `canvas::Program` impl below.
 impl CanvasPage {
+    /// Furthest the user can zoom out.
     const MIN_ZOOM: f32 = 0.1;
+    /// Furthest the user can zoom in.
     const MAX_ZOOM: f32 = 4.0;
+    /// Multiplier applied to scroll input before it changes `zoom`; higher
+    /// = faster zooming per wheel notch/trackpad pixel.
     const ZOOM_SENSITIVITY: f32 = 0.1;
+
+    /// How much wider than the edited node the reserved canvas gap is, both
+    /// for the editor's `Row` sizing in `view()` and for centering the node
+    /// within that gap in the click-to-edit camera animation.
+    const EDITOR_GAP_MULTIPLIER: f32 = 1.5;
+    const CAMERA_ANIM_DURATION: Duration = Duration::from_millis(350);
+
+    /// Whether a camera transition is currently in flight; used by the app's
+    /// subscription to decide whether to keep ticking the animation forward.
+    pub fn is_animating_camera(&self) -> bool {
+        self.camera_anim.is_some()
+    }
 
     pub fn view(&self) -> Element<'_, CanvasMessage> {
         use cosmic::iced::widget::{Stack, pin};
@@ -129,12 +179,27 @@ impl CanvasPage {
         // Now we return the stack with the canvas and all the nodes.
         // Redraw with the editor if SOME.
         match &self.editor {
-            Some(editor) => widget::row![
-                widget::container(stack)
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-                editor.view().map(CanvasMessage::Editor),
-            ].into(),
+            Some(editor) => {
+                // Reserve screen-space equal to `EDITOR_GAP_MULTIPLIER`x the
+                // edited node's width *at 1x zoom* for the canvas; the editor
+                // fills the rest. Using the node's raw world-space width (not
+                // `* self.zoom`) keeps this gap — and the editor's width —
+                // stable while the click-to-edit camera animation interpolates
+                // zoom, instead of visibly shrinking/growing along with it.
+                // Iced re-resolves this Row on every layout pass, so the
+                // editor's width stays correct across window resizes and nav
+                // bar toggles without any manual tracking.
+                let node_width = self.nodes.iter()
+                    .find(|n| n.id == editor.node_id)
+                    .map_or(0.0, |n| n.size.width);
+
+                widget::row![
+                    widget::container(stack)
+                        .width(Length::Fixed(node_width * Self::EDITOR_GAP_MULTIPLIER))
+                        .height(Length::Fill),
+                    editor.view().map(CanvasMessage::Editor),
+                ].into()
+            },
 
             None => widget::container(stack)
                     .width(Length::Fill)
@@ -174,7 +239,27 @@ impl CanvasPage {
             },
             CanvasMessage::NodeClicked { id } => {
                 if let Some(node) = self.nodes.iter().find(|n| n.id == id) {
-                    self.editor = Some(StoryNodeEditor::new(id, node.title.clone()));
+                    let title = node.title.clone();
+                    let size = node.size.clone();
+                    let position = node.position.clone();
+
+                    self.editor = Some(StoryNodeEditor::new(id, title));
+                    self.saved_camera = Some((self.offset, self.zoom));
+
+                    // Target zoom is 1.0, so world and screen units coincide
+                    // and `screen = world + offset`.
+                    let canvas_width = size.width * Self::EDITOR_GAP_MULTIPLIER;
+                    let canvas_height = self.last_bounds.get().height;
+                    let node_center = Point::new(
+                        position.x + size.width / 2.0,
+                        position.y + size.height / 2.0,
+                    );
+                    let target_offset = Vector::new(
+                        canvas_width / 2.0 - node_center.x,
+                        canvas_height / 2.0 - node_center.y,
+                    );
+
+                    self.start_camera_animation(target_offset, 1.0);
                 }
                 Some(id)
             }
@@ -216,11 +301,51 @@ impl CanvasPage {
 
                         self.geo_cache.clear();
                     }
-                    EditorEvent::Closed => {self.editor = None}
+                    EditorEvent::Closed => {
+                        self.editor = None;
+                        if let Some((offset, zoom)) = self.saved_camera.take() {
+                            self.start_camera_animation(offset, zoom);
+                        }
+                    }
+                }
+                None
+            }
+
+            CanvasMessage::AnimationTick => {
+                if let Some(anim) = &self.camera_anim {
+                    let elapsed = anim.start.elapsed().as_secs_f32();
+                    let duration = anim.duration.as_secs_f32();
+                    let t = if duration > 0.0 { (elapsed / duration).clamp(0.0, 1.0) } else { 1.0 };
+
+                    let offset = Vector::new(
+                        cosmic::anim::slerp(anim.start_offset.x, anim.target_offset.x, t),
+                        cosmic::anim::slerp(anim.start_offset.y, anim.target_offset.y, t),
+                    );
+                    let zoom = cosmic::anim::slerp(anim.start_zoom, anim.target_zoom, t);
+                    let finished = t >= 1.0;
+
+                    self.offset = offset;
+                    self.zoom = zoom;
+                    self.geo_cache.clear();
+
+                    if finished {
+                        self.camera_anim = None;
+                    }
                 }
                 None
             }
         }
+    }
+
+    fn start_camera_animation(&mut self, target_offset: Vector, target_zoom: f32) {
+        self.camera_anim = Some(CameraAnimation {
+            start: Instant::now(),
+            duration: Self::CAMERA_ANIM_DURATION,
+            start_offset: self.offset,
+            start_zoom: self.zoom,
+            target_offset,
+            target_zoom,
+        });
     }
 
     // Outputs the current screen's coordinates to where it is
@@ -250,6 +375,10 @@ impl CanvasPage {
 }
 }
 
+/// The mouse gesture currently in progress on the canvas, if any. Lives in
+/// `CanvasState::interaction`; see `canvas::Program::update` for how a
+/// button press picks one of these and later events (`CursorMoved`,
+/// `ButtonReleased`) act on whichever variant is active.
 #[derive(Default, Clone, Copy)]
 
 pub enum CanvasInteraction {
@@ -263,6 +392,15 @@ pub enum CanvasInteraction {
     }
 }
 
+/// Persistent canvas widget state: the current gesture plus the live
+/// keyboard modifiers, tracked independently since `Ctrl` needs to be known
+/// the moment a mouse button is pressed, not just while a gesture is active.
+#[derive(Default, Clone, Copy)]
+pub struct CanvasState {
+    interaction: CanvasInteraction,
+    modifiers: Modifiers,
+}
+
 /// The renderer for the canvas page. `fn draw()` uses
 /// immediate mode rendering. This gets redrawn every frame.
 //
@@ -273,42 +411,68 @@ pub enum CanvasInteraction {
 //  Read more here:
 //  https://pop-os.github.io/libcosmic/cosmic/iced/daemon/program/graphics/geometry/struct.Frame.html#method.fill_text
 impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
-    type State = CanvasInteraction;
+    type State = CanvasState;
 
     fn update(
         &self,
-        state: &mut CanvasInteraction,
+        state: &mut CanvasState,
         event: &canvas::Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<CanvasMessage>> {
+        // Keep modifier tracking live even while the editor has the canvas
+        // frozen below, so Ctrl-panning is correct the instant control
+        // returns rather than lagging one keypress behind.
+        if let canvas::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
+            state.modifiers = *modifiers;
+            return None;
+        }
+
+        // Freeze all canvas interaction — panning, node dragging, clicking
+        // another node to open a new editor session, and zoom — while the
+        // editor is open. Otherwise those would fight the camera position
+        // the click-to-edit animation just settled on. Control returns once
+        // the editor is closed.
+        if self.editor.is_some() {
+            return Some(canvas::Action::capture());
+        }
+
         let cursor_position = cursor.position_in(bounds)?;
 
         match event {
-            // TODO: Add doc later
-            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let world_position = self.screen_to_world(cursor_position);
+            // Middle-click-drag always pans, regardless of what's under the cursor.
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) => {
+                state.interaction = CanvasInteraction::Panning { last: cursor_position };
+                Some(canvas::Action::capture())
+            }
 
-                if let Some(node) = self.nodes.iter().rev().find(|n| n.contains(world_position)) {
-                    *state = CanvasInteraction::DraggingNode {
-                        id: node.id,
-                        last: cursor_position,
-                        start: cursor_position,
-                    };
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if state.modifiers.control() {
+                    // Ctrl+drag always pans, even with the cursor on top of a node.
+                    state.interaction = CanvasInteraction::Panning { last: cursor_position };
                 } else {
-                    // If no node was clicked, we start panning the canvas.
-                    *state = CanvasInteraction::Panning { last: cursor_position };
+                    let world_position = self.screen_to_world(cursor_position);
+
+                    // With no modifiers, a plain left click only ever drags or
+                    // clicks a node — it no longer pans when it misses one.
+                    if let Some(node) = self.nodes.iter().rev().find(|n| n.contains(world_position)) {
+                        state.interaction = CanvasInteraction::DraggingNode {
+                            id: node.id,
+                            last: cursor_position,
+                            start: cursor_position,
+                        };
+                    }
                 }
 
                 Some(canvas::Action::capture())
             }
-            // This is where we create match arms for `state: &mut CanvasInteraction` to handle the panning logic.
-            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => match *state {
+            // This is where we create match arms for `state.interaction` to handle the panning logic.
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => match state.interaction {
                 CanvasInteraction::Idle => None,
                 // This updates practically every frame while your mouse moves on the canvas.
                 CanvasInteraction::Panning { last } => {
                     let delta = cursor_position - last;
-                    *state = CanvasInteraction::Panning { last: cursor_position };
+                    state.interaction = CanvasInteraction::Panning { last: cursor_position };
                     Some(canvas::Action::publish(CanvasMessage::Panned(delta)).and_capture())
                 },
 
@@ -318,19 +482,19 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
                         screen_delta.x / self.zoom,
                         screen_delta.y / self.zoom,
                     );
-                    *state = CanvasInteraction::DraggingNode { id, last: cursor_position, start };
+                    state.interaction = CanvasInteraction::DraggingNode { id, last: cursor_position, start };
                     Some(
                         canvas::Action::publish(CanvasMessage::NodeDragged { id, delta: world_delta })
                         .and_capture()
                     )
                 }
             }
-            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left | mouse::Button::Middle)) => {
                 let click_threshold: f32 = 5.0;
                 // Decide, only now that the gesture is over, whether it was a
                 // click or a drag — by checking total distance traveled since
                 // the original press.
-                let message = match *state {
+                let message = match state.interaction {
                     CanvasInteraction::DraggingNode { id, start, .. } => {
                         let distance = cursor_position - start;
                         let moved = (distance.x * distance.x + distance.y * distance.y).sqrt();
@@ -339,7 +503,7 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
                     _ => None,
                 };
 
-                *state = CanvasInteraction::Idle;
+                state.interaction = CanvasInteraction::Idle;
 
                 match message {
                     Some(message) => Some(canvas::Action::publish(message).and_capture()),
@@ -375,7 +539,7 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
     /// In this method, things are drawn in immediate mode.
     fn draw(
         &self,
-        _state: &CanvasInteraction,
+        _state: &CanvasState,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,

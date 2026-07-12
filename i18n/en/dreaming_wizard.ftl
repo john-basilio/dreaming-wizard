@@ -2,7 +2,7 @@ app-title = Dreaming Wizard
 repository = https://github.com/john-basilio/dreaming-wizard
 git-description = Git commit {$hash} on {$date}
 
-## Header Start
+## Header
 
 # Header Start menus
 hs_file = File
@@ -19,6 +19,9 @@ about_comments = A narrative tool for creative storytelling.
 
 # Header Start: Canvas
 item_add_node = New Story Node
+
+# Header Center: Title
+project_title_prefix = Project: 
 # <--------------------->
 
 ## Nav tabs

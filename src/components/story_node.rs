@@ -9,6 +9,9 @@ use cosmic::widget::{
 use serde::{Serialize, Deserialize};
 
 
+/// A single node on the story canvas. `position`/`size` are in *world*
+/// space (unaffected by `CanvasPage::zoom`) — `nav::canvas` is what
+/// converts between world and screen coordinates for drawing/hit-testing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoryNode {
     pub id: Uuid,
@@ -17,12 +20,14 @@ pub struct StoryNode {
     pub title: String,
 }
 
+/// A node's top-left corner, in world-space units.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodePosition {
     pub x: f32,
     pub y: f32
 }
 
+/// A node's footprint, in world-space units (i.e. at 1x zoom).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSize {
     pub width: f32,
@@ -55,22 +60,31 @@ impl Default for StoryNode {
 
 impl StoryNode {
 
-
     #[allow(dead_code)]
     // TODO: decide use
     pub fn new(id: Uuid, position: NodePosition, size: NodeSize, title: impl Into<String>) -> Self {
         Self { id, position, size, title: title.into() }
     }
 
+    /// World-space rectangle occupied by this node, used for both drawing
+    /// and hit-testing (see `contains`).
     pub fn bounds(&self) -> Rectangle {
         Rectangle::new(self.position.clone().into(), self.size.clone().into())
 
     }
 
+    /// Whether a world-space `point` falls inside this node. Callers must
+    /// convert screen coordinates (e.g. mouse position) to world space via
+    /// `CanvasPage::screen_to_world` first — this does no zoom/offset math
+    /// itself.
     pub fn contains(&self, point: Point) -> bool {
         self.bounds().contains(point)
     }
 
+    /// Draws just the node's rounded-rectangle shape onto the canvas frame.
+    /// The title label is rendered separately as an overlaid `view()`
+    /// widget in `CanvasPage::view` — see the note on `canvas::Program` in
+    /// `nav/canvas.rs` for why text can't be drawn here.
     pub fn draw(&self, frame: &mut Frame) {
         let path = Path::rounded_rectangle(
             self.position.clone().into(),
