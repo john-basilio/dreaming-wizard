@@ -41,10 +41,12 @@ use std::{
 
 use crate::nav::{
     CanvasPage, CanvasMessage,
+    CharactersPage, CharactersMessage,
 };
 
 use crate::components::{
     ProjectFile, ProjectData,
+    character_card_editor::EditorMessage,
 };
 
 
@@ -80,7 +82,8 @@ pub struct AppModel {
     /// Canvas Page
     pub canvas: CanvasPage,
 
-
+    /// Characters Page
+    pub characters: CharactersPage,
 
 }
 
@@ -93,7 +96,7 @@ pub enum DrawerPage {
 /// The page to display in the application. Triggered by nav.
 pub enum Page {
     Canvas,
-    //Characters,
+    Characters,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -105,7 +108,7 @@ pub enum Message {
     HeaderHelp(HelpMenuAction),
     // Nav pages
     Canvas(CanvasMessage),
-    // Characters,
+    Characters(CharactersMessage),
     
     // Direct Actions
     CloseDrawer,
@@ -114,6 +117,12 @@ pub enum Message {
     LaunchUrl(String),
     // Raw key presses, matched against `AppModel::key_binds`.
     Key(Modifiers, Key, Physical),
+    // The Load file picker (opened from `FileMenuAction::Load`) resolved;
+    // `None` if it was cancelled or failed to open.
+    LoadPathPicked(Option<std::path::PathBuf>),
+    // The Save file picker (opened from `FileMenuAction::Save`) resolved;
+    // `None` if it was cancelled or failed to open.
+    SavePathPicked(Option<std::path::PathBuf>),
 }
 
 /// For future purposes, we're expecting interactions to be often with 
@@ -184,14 +193,6 @@ impl AppModel {
         }
     }
 
-    /// The project file path Save/Load should use: the last remembered one,
-    /// or a fixed fallback location if none is set yet.
-    fn project_path(&self) -> std::path::PathBuf {
-        self.config.last_project_path.as_ref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| dirs::download_dir().unwrap().join("dw.json"))
-    }
-
     /// Reads and applies a project file from `path` onto canvas/metadata
     /// state. Returns whether it succeeded (missing file, unreadable, or
     /// invalid JSON all just report `false` rather than panicking) — on
@@ -211,6 +212,8 @@ impl AppModel {
             project.canvas.last_camera.0,
             project.canvas.last_camera.1,
         );
+        self.characters.characters = project.characters.characters;
+        self.characters.editor = None;
 
         true
     }
@@ -284,8 +287,13 @@ impl cosmic::Application for AppModel {
         nav.insert()
             .text(fl!("nav-canvas-id"))
             .data::<Page>(Page::Canvas)
-            .icon(icon::from_name("applications-science-symbolic"))
+            .icon(icon::from_name("insert-drawing-symbolic"))
             .activate();
+
+        nav.insert()
+            .text(fl!("nav-characters-id"))
+            .data::<Page>(Page::Characters)
+            .icon(icon::from_name("system-users-symbolic"));
 
         // Create the about widget
         let about = About::default()
@@ -318,6 +326,7 @@ impl cosmic::Application for AppModel {
         let mut app = AppModel {
             core,
             canvas: CanvasPage::default(),
+            characters: CharactersPage::default(),
             about,
             nav,
             key_binds,
@@ -337,9 +346,10 @@ impl cosmic::Application for AppModel {
             if app.try_load_project(&path) {
                 println!("Loaded from {}", path.display());
             } else {
-                // `app.canvas`/`app.project_meta` are already fresh defaults
-                // from the struct literal above, so there's nothing to
-                // reset here beyond forgetting the bad path.
+                // `app.canvas`/`app.project_meta`/`app.characters` are
+                // already fresh defaults from the struct literal above, so
+                // there's nothing to reset here beyond forgetting the bad
+                // path.
                 app.config.last_project_path = None;
                 app.save_config();
 
@@ -410,12 +420,12 @@ impl cosmic::Application for AppModel {
     }
 
     fn header_center(&self) -> Vec<Element<'_, Self::Message>> {
-        // Update `Header Title` with file's project name or "New Project".
+        // Update `Header Title` with file's project name or the fallback title.
 
         let display_name = if self.project_meta.name.is_empty() {
-            "New Project"
+            fl!("project-title-fallback")
         } else {
-            &self.project_meta.name
+            self.project_meta.name.clone()
         };
 
         let title = text::heading(format!(
@@ -502,6 +512,9 @@ impl cosmic::Application for AppModel {
             Page::Canvas => {
                 self.canvas.view().map(Message::Canvas)
             },
+            Page::Characters => {
+                self.characters.view().map(Message::Characters)
+            },
         };
 
         widget::container(content)
@@ -523,30 +536,32 @@ impl cosmic::Application for AppModel {
         match message {
             // Header Start Messages
             Message::HeaderFile(file_intent) => { match file_intent {
+                // Both Load and Save now always prompt via the system file
+                // picker (xdg-portal) rather than silently reusing the
+                // remembered path — the actual load/save work happens once
+                // the picker resolves, in the `LoadPathPicked`/
+                // `SavePathPicked` arms below.
                 FileMenuAction::Load => {
-                    let path = self.project_path();
+                    return cosmic::task::future(async {
+                        let dialog = cosmic::dialog::file_chooser::open::Dialog::new()
+                            .title(fl!("dialog-load-title"))
+                            // ashpd's open-file portal request doesn't expose a
+                            // way to set a starting directory yet (see the
+                            // `directory` field's own doc comment in
+                            // `cosmic::dialog::file_chooser::open::Dialog`), so
+                            // unlike the Save dialog below, there's no
+                            // `.directory(...)` call to make here.
+                            .filter(
+                                cosmic::dialog::file_chooser::FileFilter::new(&fl!("dialog-json-filter-label"))
+                                    .glob("*.json")
+                                    .glob("*.JSON"),
+                            );
 
-                    // Any failure here (missing file, unreadable, corrupt
-                    // JSON) falls back to a fresh session instead of the
-                    // `.expect()` panics this used to have — and forgets the
-                    // bad remembered path so we don't keep retrying it.
-                    if self.try_load_project(&path) {
-                        self.config.last_project_path = Some(path.display().to_string());
-                        self.save_config();
+                        let path = dialog.open_file().await.ok()
+                            .and_then(|response| response.url().to_file_path().ok());
 
-                        println!("Loaded from {}", path.display());
-                    } else {
-                        self.canvas = CanvasPage::default();
-                        self.project_meta = ProjectData::default();
-
-                        self.config.last_project_path = None;
-                        self.save_config();
-
-                        eprintln!(
-                            "Could not load project from {}; starting a new session.",
-                            path.display()
-                        );
-                    }
+                        cosmic::Action::App(Message::LoadPathPicked(path))
+                    });
                 },
 
                 FileMenuAction::Save => {
@@ -560,44 +575,105 @@ impl cosmic::Application for AppModel {
 
                     // No UI yet to set these, so default them until project settings exist.
                     if self.project_meta.name.is_empty() {
-                        self.project_meta.name = "Unknown".to_string();
+                        self.project_meta.name = fl!("project-name-fallback");
                     }
                     if self.project_meta.author.is_empty() {
-                        self.project_meta.author = "Unknown".to_string();
+                        self.project_meta.author = fl!("project-author-fallback");
                     }
 
-                    let project = ProjectFile::new(
-                        self.canvas.nodes.clone(),
-                        (self.canvas.offset.x, self.canvas.offset.y),
-                        self.project_meta.clone(),
-                    );
+                    // `config.project_dir` is the single hardcoded source for
+                    // this (see its doc comment) — nothing else needs its own
+                    // copy of the path.
+                    let starting_dir = std::path::PathBuf::from(&self.config.project_dir);
 
-                    let path = self.project_path();
+                    return cosmic::task::future(async move {
+                        let dialog = cosmic::dialog::file_chooser::save::Dialog::new()
+                            .title(fl!("dialog-save-title"))
+                            .file_name("project.json".to_string())
+                            .directory(starting_dir)
+                            .filter(
+                                cosmic::dialog::file_chooser::FileFilter::new(&fl!("dialog-json-filter-label"))
+                                    .glob("*.json")
+                                    .glob("*.JSON"),
+                            );
 
-                    match File::create(&path) {
-                        Ok(file) => {
-                            let writer = BufWriter::new(file);
+                        let path = match dialog.save_file().await {
+                            Ok(response) => response.url().and_then(|url| url.to_file_path().ok()),
+                            Err(_) => None,
+                        };
 
-                            match serde_json::to_writer_pretty(writer, &project) {
-                                Ok(()) => {
-                                    self.config.last_project_path = Some(path.display().to_string());
-                                    self.save_config();
-
-                                    println!("Saved to {}", path.display());
-                                }
-                                Err(err) => {
-                                    eprintln!("failed to serialize project to {}: {err}", path.display());
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("failed to create savefile at {}: {err}", path.display());
-                        }
-                    }
+                        cosmic::Action::App(Message::SavePathPicked(path))
+                    });
                 },
 
 
             }}
+
+            Message::LoadPathPicked(None) => {
+                // Dialog was cancelled or failed to open; nothing to do.
+            }
+            Message::LoadPathPicked(Some(path)) => {
+                // Any failure here (unreadable, corrupt JSON) falls back to
+                // a fresh session instead of the `.expect()` panics this
+                // used to have — and forgets the bad remembered path so we
+                // don't keep retrying it.
+                if self.try_load_project(&path) {
+                    self.config.last_project_path = Some(path.display().to_string());
+                    self.save_config();
+
+                    println!("Loaded from {}", path.display());
+                } else {
+                    self.canvas = CanvasPage::default();
+                    self.project_meta = ProjectData::default();
+                    self.characters = CharactersPage::default();
+
+                    self.config.last_project_path = None;
+                    self.save_config();
+
+                    eprintln!(
+                        "Could not load project from {}; starting a new session.",
+                        path.display()
+                    );
+                }
+            }
+
+            Message::SavePathPicked(None) => {
+                // Dialog was cancelled or failed to open; nothing to do.
+            }
+            Message::SavePathPicked(Some(path)) => {
+                // Built fresh here (rather than passed through the message)
+                // so the write reflects whatever the latest state is by the
+                // time the picker resolves, not a snapshot from before the
+                // (async) dialog was even shown.
+                let project = ProjectFile::new(
+                    self.canvas.nodes.clone(),
+                    (self.canvas.offset.x, self.canvas.offset.y),
+                    self.project_meta.clone(),
+                    self.characters.characters.clone(),
+                );
+
+                match File::create(&path) {
+                    Ok(file) => {
+                        let writer = BufWriter::new(file);
+
+                        match serde_json::to_writer_pretty(writer, &project) {
+                            Ok(()) => {
+                                self.config.last_project_path = Some(path.display().to_string());
+                                self.save_config();
+
+                                println!("Saved to {}", path.display());
+                            }
+                            Err(err) => {
+                                eprintln!("failed to serialize project to {}: {err}", path.display());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("failed to create savefile at {}: {err}", path.display());
+                    }
+                }
+            }
+
             Message::HeaderCanvas(canvas_intent) => { match canvas_intent {
                 CanvasMenuAction::AddNode => {
                     return Task::done(cosmic::Action::App(
@@ -616,6 +692,41 @@ impl cosmic::Application for AppModel {
             // Other messages
             Message::Canvas(msg) => {
                 if let Some(_node_id) = self.canvas.update(msg) {
+                    self.core_mut().nav_bar_set_toggled(false);
+                }
+            }
+
+            // Intercepted here (rather than in `CharactersPage::update`)
+            // because only the top-level `update` can return a `Task` — the
+            // system file picker (xdg-portal, matching the `xdg-portal`
+            // libcosmic feature already enabled in Cargo.toml) is async.
+            // The result comes back around as `EditorMessage::AvatarPicked`,
+            // which *does* flow through the normal `Message::Characters(msg)`
+            // arm below.
+            Message::Characters(CharactersMessage::Editor(EditorMessage::ChangeAvatar)) => {
+                return cosmic::task::future(async {
+                    let dialog = cosmic::dialog::file_chooser::open::Dialog::new()
+                        .filter(
+                            cosmic::dialog::file_chooser::FileFilter::new(&fl!("dialog-image-filter-label"))
+                                .glob("*.png")
+                                .glob("*.PNG")
+                                .glob("*.jpg")
+                                .glob("*.JPG")
+                                .glob("*.jpeg")
+                                .glob("*.JPEG"),
+                        );
+
+                    let path = dialog.open_file().await.ok()
+                        .and_then(|response| response.url().to_file_path().ok());
+
+                    cosmic::Action::App(Message::Characters(CharactersMessage::Editor(
+                        EditorMessage::AvatarPicked(path),
+                    )))
+                });
+            }
+
+            Message::Characters(msg) => {
+                if let Some(_character_id) = self.characters.update(msg) {
                     self.core_mut().nav_bar_set_toggled(false);
                 }
             }
