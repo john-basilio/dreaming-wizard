@@ -39,6 +39,15 @@ impl Default for CharactersPage {
     }
 }
 
+impl CharactersPage {
+    /// A truly empty page — unlike `Default`, which seeds one placeholder
+    /// character for the very first run's UI, this is for resetting an
+    /// existing session (e.g. starting a new project) to a blank state.
+    pub fn empty() -> Self {
+        Self { characters: Vec::new(), editor: None }
+    }
+}
+
 /// Messages emitted by the Characters page.
 #[derive(Debug, Clone)]
 pub enum CharactersMessage {
