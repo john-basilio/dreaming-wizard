@@ -10,8 +10,9 @@ hs_help = Help
 hs_canvas = Canvas
 
 # Header Start: File
+item_new = New Project
 item_save = Save
-item_load = Load
+item_load = Load Project
 
 # Header Start: Help
 item_about = About
@@ -31,15 +32,49 @@ project-author-fallback = Unknown
 
 ## File dialogs
 
-# Load dialog: window title
-dialog-load-title = Open Project
-# Save dialog: window title
-dialog-save-title = Save Project
-# Load/Save dialog: file filter label, restricting choices to JSON files
-dialog-json-filter-label = JSON Project
+# Load dialog: window title (picks an existing project folder)
+dialog-load-title = Choose Project Folder
+# Save dialog: window title (the "Browse" button inside SaveProjectDialog;
+# picks the *parent* folder a new project's own directory is created under)
+dialog-save-title = Choose Location
 # Avatar picker dialog: file filter label, restricting choices to images
 dialog-image-filter-label = Images
 # <--------------------->
+
+## Popups
+
+# SimplePopup: close ("X") button tooltip, shared by every use of the popup
+popup-close-tooltip = Close
+# Load Project popup: title, shared by both failure reasons below
+popup-load-error-title = Couldn't Load Project
+# Load Project popup: shown when the chosen folder has no project.json
+popup-missing-project-message = This folder doesn't contain a project.json file.
+# Load Project popup: shown when project.json exists but isn't valid JSON
+popup-invalid-project-message = This folder's project.json file is invalid or corrupted.
+# Save Project popup: title
+popup-save-error-title = Couldn't Save Project
+# Save Project popup: shown when the new project's directory couldn't be created
+popup-save-dir-failed-message = Couldn't create the project folder. Check the location and try again.
+# <--------------------->
+
+## Save Project dialog (first save of a brand-new project)
+
+save-dialog-title = Save New Project
+save-dialog-name-label = Name
+save-dialog-name-placeholder = My Project
+save-dialog-path-label = Save as
+save-dialog-path-placeholder = Choose a location...
+save-dialog-browse = Browse
+save-dialog-cancel = Cancel
+save-dialog-confirm = Save Project
+# Shown when Save Project is pressed before a location has been chosen
+save-dialog-error-incomplete = Choose a location before saving.
+# Shown when the resulting Name+location already exists and isn't empty
+save-dialog-error-not-empty = Path is not empty.
+# <--------------------->
+
+# Toast shown after silently re-saving an already-open project
+toast-saved = Saved ✓
 
 ## Nav tabs
 

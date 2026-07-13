@@ -34,6 +34,7 @@ pub fn character_card<'a, Message: Clone + 'a>(
             .width(Length::Fixed(AVATAR_SIZE))
             .height(Length::Fixed(AVATAR_SIZE))
             .content_fit(ContentFit::Cover)
+            .border_radius(12.0)
             .into(),
         None => icon::from_name("avatar-default-symbolic").icon().size(48).into(),
     };
