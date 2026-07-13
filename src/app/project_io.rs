@@ -144,14 +144,14 @@ impl AppModel {
                 self.config.last_project_path = None;
                 self.save_config();
 
-                return self.update_title();
+                self.update_title()
             }
 
             // Always prompts via the system folder picker (xdg-portal) —
             // the actual load work happens once it resolves, in
             // `handle_load_dir_picked`.
             FileMenuAction::Load => {
-                return cosmic::task::future(async {
+                cosmic::task::future(async {
                     // Picks a *directory*, not the JSON file directly — see
                     // `handle_load_dir_picked` for the `project.json`-on-
                     // top-level check. No file filter: folder pickers don't
@@ -161,41 +161,53 @@ impl AppModel {
                     let path = dialog.open_folder().await.ok().and_then(|response| response.url().to_file_path().ok());
 
                     cosmic::Action::App(Message::LoadDirPicked(path))
-                });
+                })
             }
 
-            FileMenuAction::Save => {
-                let now = jiff::Timestamp::now().to_string();
-
-                if self.project_meta.created_at.is_empty() {
-                    self.project_meta.created_at = now.clone();
-                }
-                self.project_meta.updated_at = now;
-                self.project_meta.app_version = env!("CARGO_PKG_VERSION").to_string();
-
-                // No UI yet to set the author, so default it until project
-                // settings exist. The name, by contrast, is set
-                // interactively below (either already set from a prior
-                // save/load, or `SaveProjectDialog` collects it).
-                if self.project_meta.author.is_empty() {
-                    self.project_meta.author = fl!("project-author-fallback");
-                }
-
-                if let Some(path) = self.config.last_project_path.clone() {
-                    // Already have a project open — re-save straight to it,
-                    // no dialog; just a brief "Saved" toast.
-                    self.write_project_file(&PathBuf::from(path));
-                    self.show_saved_toast();
-                } else {
-                    // First save of a brand-new project: open the name/
-                    // location dialog instead of saving immediately.
-                    if self.project_meta.name.is_empty() {
-                        self.project_meta.name = fl!("project-name-fallback");
-                    }
-                    self.save_dialog = Some(SaveProjectDialog::new(self.project_meta.name.clone()));
-                }
-            }
+            FileMenuAction::Save => self.save_project(),
         }
+    }
+
+    /// Persists the *entire* project to disk — straight to the remembered
+    /// path if one exists, or via the name/location dialog for a
+    /// brand-new project. This is what the File menu's Save has always
+    /// done; both editors' Save buttons now trigger the same thing (rather
+    /// than only committing their own node/character in memory), since a
+    /// per-editor save that never reached disk would be indistinguishable
+    /// from an unsaved draft after a crash or `New`/`Load`. The File menu's
+    /// Save is still useful on its own for changes an editor never touches
+    /// — e.g. added/deleted nodes or characters.
+    pub(super) fn save_project(&mut self) -> Task<cosmic::Action<Message>> {
+        let now = jiff::Timestamp::now().to_string();
+
+        if self.project_meta.created_at.is_empty() {
+            self.project_meta.created_at = now.clone();
+        }
+        self.project_meta.updated_at = now;
+        self.project_meta.app_version = env!("CARGO_PKG_VERSION").to_string();
+
+        // No UI yet to set the author, so default it until project
+        // settings exist. The name, by contrast, is set interactively
+        // below (either already set from a prior save/load, or
+        // `SaveProjectDialog` collects it).
+        if self.project_meta.author.is_empty() {
+            self.project_meta.author = fl!("project-author-fallback");
+        }
+
+        if let Some(path) = self.config.last_project_path.clone() {
+            // Already have a project open — re-save straight to it, no
+            // dialog; just a brief "Saved" toast.
+            self.write_project_file(&PathBuf::from(path));
+            self.show_saved_toast();
+        } else {
+            // First save of a brand-new project: open the name/location
+            // dialog instead of saving immediately.
+            if self.project_meta.name.is_empty() {
+                self.project_meta.name = fl!("project-name-fallback");
+            }
+            self.save_dialog = Some(SaveProjectDialog::new(self.project_meta.name.clone()));
+        }
+
         Task::none()
     }
 

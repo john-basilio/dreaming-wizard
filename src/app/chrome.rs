@@ -30,9 +30,16 @@ pub enum FileMenuAction {
     Save,
 }
 
+/// "Add" items are contextual to whichever page is active (see
+/// `mod.rs`'s `Message::HeaderAction` handler, which also switches to that
+/// page if it isn't already active) rather than each having their own
+/// static keybind — that's why, unlike `FileMenuAction`/`HelpMenuAction`,
+/// these don't all appear in `default_key_binds`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CanvasMenuAction {
+pub enum ActionMenuAction {
     AddNode,
+    AddCharacter,
+    Find,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,7 +50,7 @@ pub enum HelpMenuAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuAction {
     File(FileMenuAction),
-    Canvas(CanvasMenuAction),
+    Action(ActionMenuAction),
     Help(HelpMenuAction),
 }
 
@@ -53,7 +60,7 @@ impl menu::action::MenuAction for MenuAction {
     fn message(&self) -> Self::Message {
         match self {
             MenuAction::File(intent) => Message::HeaderFile(*intent),
-            MenuAction::Canvas(intent) => Message::HeaderCanvas(*intent),
+            MenuAction::Action(intent) => Message::HeaderAction(*intent),
             MenuAction::Help(intent) => Message::HeaderHelp(*intent),
         }
     }
@@ -75,15 +82,19 @@ pub(super) fn default_key_binds() -> HashMap<menu::KeyBind, MenuAction> {
         KeyBind { modifiers: vec![Modifier::Ctrl], key: Key::Character("o".into()) }, // "o" for open/load
         MenuAction::File(FileMenuAction::Load),
     );
+    // Ctrl+A is deliberately absent here: it's handled directly in
+    // `mod.rs`'s `Message::Key` arm, dispatching to whichever page is
+    // active (Add Node on canvas, Add Character on characters) instead of
+    // one fixed `MenuAction` — see `ActionMenuAction`'s doc comment.
     key_binds.insert(
-        KeyBind { modifiers: vec![Modifier::Ctrl], key: Key::Character("a".into()) },
-        MenuAction::Canvas(CanvasMenuAction::AddNode),
+        KeyBind { modifiers: vec![Modifier::Ctrl], key: Key::Character("f".into()) },
+        MenuAction::Action(ActionMenuAction::Find),
     );
 
     key_binds
 }
 
-/// Builds the File/Canvas/Help header menus.
+/// Builds the File/Action/Help header menus.
 pub(super) fn header_start(key_binds: &HashMap<menu::KeyBind, MenuAction>) -> Vec<Element<'_, Message>> {
     let file_menu = menu::bar(vec![menu::Tree::with_children(
         menu::root(fl!("hs_file")).apply(Element::from),
@@ -100,19 +111,24 @@ pub(super) fn header_start(key_binds: &HashMap<menu::KeyBind, MenuAction>) -> Ve
     // "Ctrl + _" hints — `menu::bar`'s default width (150) is too tight.
     .item_width(ItemWidth::Uniform(190));
 
-    let canvas_menu = menu::bar(vec![menu::Tree::with_children(
-        menu::root(fl!("hs_canvas")).apply(Element::from),
+    let action_menu = menu::bar(vec![menu::Tree::with_children(
+        menu::root(fl!("hs_action")).apply(Element::from),
         menu::items(
             key_binds,
-            vec![menu::Item::Button(
-                fl!("item_add_node"),
-                None,
-                MenuAction::Canvas(CanvasMenuAction::AddNode),
-            )],
+            vec![
+                // "Add Node"/"Add Character" intentionally don't show a
+                // keybind hint here — Ctrl+A is contextual to whichever
+                // page is active (see `ActionMenuAction`'s doc comment),
+                // not a fixed binding to either menu item.
+                menu::Item::Button(fl!("item_add_node"), None, MenuAction::Action(ActionMenuAction::AddNode)),
+                menu::Item::Button(fl!("item_add_character"), None, MenuAction::Action(ActionMenuAction::AddCharacter)),
+                menu::Item::Button(fl!("item_find"), None, MenuAction::Action(ActionMenuAction::Find)),
+            ],
         ),
     )])
-    // "New Story Node" is the longest label in any of our menus.
-    .item_width(ItemWidth::Uniform(200));
+    // "Add Character" plus its "Ctrl + F" hint on "Find" (the widest
+    // label/hint combination in this menu) is the longest of any menu.
+    .item_width(ItemWidth::Uniform(220));
 
     let help_menu = menu::bar(vec![menu::Tree::with_children(
         menu::root(fl!("hs_help")).apply(Element::from),
@@ -124,7 +140,7 @@ pub(super) fn header_start(key_binds: &HashMap<menu::KeyBind, MenuAction>) -> Ve
     // "About" has no keybind hint, so it only needs to fit the label.
     .item_width(ItemWidth::Uniform(160));
 
-    vec![file_menu.into(), canvas_menu.into(), help_menu.into()]
+    vec![file_menu.into(), action_menu.into(), help_menu.into()]
 }
 
 /// Builds the header's centered title (`project_name`, or a fallback if the

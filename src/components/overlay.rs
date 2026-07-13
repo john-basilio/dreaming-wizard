@@ -1,9 +1,10 @@
 //! Small, reusable floating-UI helpers: a dimming backdrop for modal
-//! overlays and a fading toast notice. Pure presentation — no knowledge of
-//! `AppModel` or any other app-specific state; callers pass in whatever
-//! content and timing they need. `app::overlays` is the current consumer
-//! (popup/save-dialog/toast layering), but nothing here is app-shell
-//! specific.
+//! overlays, a fading toast notice, and `HoverTooltip` (a delayed-fade
+//! tooltip timer for the canvas/characters pages' floating "add" buttons).
+//! Pure presentation — no knowledge of `AppModel` or any other app-specific
+//! state; callers pass in whatever content and timing they need.
+//! `app::overlays` is the current consumer of the popup/save-dialog/toast
+//! layering, but nothing here is app-shell specific.
 
 use std::time::{Duration, Instant};
 
@@ -77,6 +78,144 @@ pub fn with_toast<'a, Message: 'a>(
         .into()
 }
 
+/// Layers `button` in the bottom-right corner of `content`, `padding` away
+/// from both edges, with `tooltip` floating just above it (also
+/// bottom-right anchored, `tooltip_offset` further up than `padding`).
+/// `tooltip` is expected to already have its own alpha baked in (see
+/// `toast_box`/`HoverTooltip`) — at `alpha == 0.0` it's fully transparent,
+/// so it's safe to always include it here without shifting the button's
+/// own layout when it fades in/out. Used for the canvas/characters pages'
+/// floating "add" buttons.
+pub fn with_corner_button<'a, Message: 'a>(
+    content: Element<'a, Message>,
+    button: Element<'a, Message>,
+    tooltip: Element<'a, Message>,
+    padding: f32,
+    tooltip_offset: f32,
+) -> Element<'a, Message> {
+    let corner = widget::container(button)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(padding)
+        .align_x(Horizontal::Right)
+        .align_y(Vertical::Bottom);
+
+    let tooltip_layer = widget::container(tooltip)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(cosmic::iced::Padding {
+            top: 0.0,
+            right: padding,
+            bottom: padding + tooltip_offset,
+            left: padding,
+        })
+        .align_x(Horizontal::Right)
+        .align_y(Vertical::Bottom);
+
+    cosmic::iced::widget::Stack::new()
+        .push(content)
+        .push(corner)
+        .push(tooltip_layer)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// Layers `panel` in the top-right corner of `content`, `padding` away from
+/// both edges — unlike `with_overlay`, there's no dimming shade and nothing
+/// captures clicks, so `content` underneath stays fully interactive (pan,
+/// drag, scroll...). A plain layout `container` never intercepts pointer
+/// events on its own; only `panel`'s own interactive widgets do. Used for
+/// the Find panel.
+pub fn with_corner_panel<'a, Message: 'a>(
+    content: Element<'a, Message>,
+    panel: Element<'a, Message>,
+    padding: f32,
+) -> Element<'a, Message> {
+    let corner = widget::container(panel)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(padding)
+        .align_x(Horizontal::Right)
+        .align_y(Vertical::Top);
+
+    cosmic::iced::widget::Stack::new()
+        .push(content)
+        .push(corner)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// Delay before a hover-triggered tooltip starts to appear, and how long
+/// its fade (in on delayed-hover, out on unhover) takes. Shared by the
+/// canvas/characters pages' floating "add" buttons via `HoverTooltip`.
+pub const TOOLTIP_HOVER_DELAY: Duration = Duration::from_millis(1500);
+pub const TOOLTIP_FADE: Duration = Duration::from_millis(300);
+
+/// Drives a hover-triggered tooltip's fade timing: invisible until the
+/// cursor has rested on its target for `TOOLTIP_HOVER_DELAY`, then fades in
+/// over `TOOLTIP_FADE`; fades back out over `TOOLTIP_FADE` on unhover — or,
+/// if the cursor left before the tooltip ever finished its delay, simply
+/// resets with no fade-out (nothing was shown yet to fade).
+#[derive(Default)]
+pub struct HoverTooltip {
+    /// Set on hover-enter, cleared on hover-exit.
+    hover_started: Option<Instant>,
+    /// Set on hover-exit, but only once the tooltip had actually started
+    /// appearing; cleared once its fade-out finishes (see `tick`).
+    hover_ended: Option<Instant>,
+}
+
+impl HoverTooltip {
+    pub fn enter(&mut self) {
+        self.hover_started = Some(Instant::now());
+        self.hover_ended = None;
+    }
+
+    pub fn exit(&mut self) {
+        if let Some(started) = self.hover_started.take()
+            && started.elapsed() >= TOOLTIP_HOVER_DELAY
+        {
+            self.hover_ended = Some(Instant::now());
+        }
+    }
+
+    /// Called on every animation tick; clears a finished fade-out so
+    /// `is_active` can go back to `false` and the driving subscription can
+    /// stop ticking.
+    pub fn tick(&mut self) {
+        if let Some(ended) = self.hover_ended
+            && ended.elapsed() >= TOOLTIP_FADE
+        {
+            self.hover_ended = None;
+        }
+    }
+
+    /// Whether a subscription needs to keep ticking this to drive its
+    /// animation forward.
+    pub fn is_active(&self) -> bool {
+        self.hover_started.is_some() || self.hover_ended.is_some()
+    }
+
+    /// Current opacity, `0.0` to `1.0`.
+    pub fn alpha(&self) -> f32 {
+        if let Some(ended) = self.hover_ended {
+            return (1.0 - ended.elapsed().as_secs_f32() / TOOLTIP_FADE.as_secs_f32()).clamp(0.0, 1.0);
+        }
+
+        let Some(started) = self.hover_started else {
+            return 0.0;
+        };
+
+        let elapsed = started.elapsed();
+        if elapsed < TOOLTIP_HOVER_DELAY {
+            return 0.0;
+        }
+        ((elapsed - TOOLTIP_HOVER_DELAY).as_secs_f32() / TOOLTIP_FADE.as_secs_f32()).clamp(0.0, 1.0)
+    }
+}
+
 /// Linear fade: fully opaque for `visible`, then ramps down to `0.0` over
 /// `fade`, clamped so it never goes negative once `fade` has fully elapsed.
 pub fn fade_alpha(shown_at: Instant, visible: Duration, fade: Duration) -> f32 {
@@ -87,6 +226,33 @@ pub fn fade_alpha(shown_at: Instant, visible: Duration, fade: Duration) -> f32 {
 
     let fade_elapsed = (elapsed - visible).as_secs_f32();
     (1.0 - fade_elapsed / fade.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+/// One-shot fade-in/hold/fade-out curve: ramps up over `fade_in`, holds at
+/// full opacity for `visible`, then ramps back down to `0.0` over
+/// `fade_out`. Used for the Find feature's "found it" glow highlight around
+/// a node/character card, which (unlike `fade_alpha`'s toast use) needs a
+/// gentle fade-in rather than snapping straight to fully visible.
+pub fn pulse_alpha(started_at: Instant, fade_in: Duration, visible: Duration, fade_out: Duration) -> f32 {
+    let elapsed = started_at.elapsed();
+
+    if elapsed < fade_in {
+        return (elapsed.as_secs_f32() / fade_in.as_secs_f32()).clamp(0.0, 1.0);
+    }
+
+    let elapsed = elapsed - fade_in;
+    if elapsed < visible {
+        return 1.0;
+    }
+
+    let elapsed = elapsed - visible;
+    (1.0 - elapsed.as_secs_f32() / fade_out.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+/// Whether `pulse_alpha` still has anything left to show — used to gate the
+/// animation-tick subscription while a glow highlight is active.
+pub fn is_pulse_active(started_at: Instant, fade_in: Duration, visible: Duration, fade_out: Duration) -> bool {
+    started_at.elapsed() < fade_in + visible + fade_out
 }
 
 /// A small pill-shaped notice box (e.g. "Saved"), faded to `alpha`.
