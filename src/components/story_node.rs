@@ -7,6 +7,7 @@ use cosmic::widget::{
     canvas::{Frame, Path, Stroke}
 };
 use serde::{Serialize, Deserialize};
+use crate::fl;
 
 
 /// A single node on the story canvas. `position`/`size` are in *world*
@@ -53,7 +54,7 @@ impl Default for StoryNode {
             id: Uuid::new_v4(), 
             position: NodePosition {x: 0.0, y:0.0}, 
             size: NodeSize {width: 200.0, height: 100.0},
-            title: "New Node".to_string() 
+            title: fl!("node-default-title")
         }
     }
 }

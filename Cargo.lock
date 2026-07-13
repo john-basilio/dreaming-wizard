@@ -1230,7 +1230,6 @@ source = "git+https://github.com/pop-os/winit.git?tag=cosmic-0.14#f737f1f5900b33
 name = "dreaming-wizard"
 version = "0.1.0"
 dependencies = [
- "dirs",
  "futures",
  "i18n-embed",
  "i18n-embed-fl",
