@@ -7,7 +7,7 @@ git-description = Git commit {$hash} on {$date}
 # Header Start menus
 hs_file = File
 hs_help = Help
-hs_canvas = Canvas
+hs_action = Action
 
 # Header Start: File
 item_new = New Project
@@ -18,8 +18,10 @@ item_load = Load Project
 item_about = About
 about_comments = A narrative tool for creative storytelling.
 
-# Header Start: Canvas
-item_add_node = New Story Node
+# Header Start: Action
+item_add_node = Add Node
+item_add_character = Add Character
+item_find = Find
 
 # Header Center: Title
 project_title_prefix = Project:
@@ -92,12 +94,19 @@ node-default-title = New Node
 
 # Editor: Label
 editor-label = Editing
+# Editor: Save (shared by the story node and character card editors)
+editor-save = Save
+# Editor: Delete (shared by the story node and character card editors)
+editor-delete = Delete
 # Editor: Close
 editor-close = Close
 # Editor: Title label
 editor-title-label = Title:
 # Editor: Title input placeholder
-editor-title-placeholder = Write node's title here... 
+editor-title-placeholder = Write node's title here...
+
+# Floating "+" button tooltip on the canvas page
+tooltip-add-node = Add Node
 
 ## Characters page
 
@@ -116,3 +125,33 @@ editor-comment-placeholder = Write a short comment here...
 editor-description-label = Description:
 # Editor: Description input placeholder
 editor-description-placeholder = Write character's description here...
+
+# Floating "+" button tooltip on the characters page
+tooltip-add-character = Add Character
+
+## Delete confirmation (shared ConfirmDialog, both pages)
+
+# Hover-delete button tooltip, shared by both story nodes and character cards
+tooltip-delete = Delete
+confirm-dialog-cancel = Cancel
+confirm-dialog-delete = Delete
+confirm-delete-node-title = Delete Story Node?
+confirm-delete-node-message = Are you sure you want to delete "{$title}"? This can't be undone.
+confirm-delete-character-title = Delete Character?
+confirm-delete-character-message = Are you sure you want to delete "{$name}"? This can't be undone.
+
+## Unsaved changes warning (shared UnsavedChangesDialog: editor close, app exit)
+
+unsaved-changes-title = Unsaved Changes
+unsaved-changes-message = You have unsaved changes. Save before closing?
+unsaved-changes-save = Save
+unsaved-changes-discard = Discard
+unsaved-changes-cancel = Cancel
+
+## Find panel (Ctrl+F)
+
+find-label = Find:
+find-placeholder = Search...
+find-target-node = Node
+find-target-character = Character
+find-close-tooltip = Close

@@ -2,7 +2,7 @@
 #![allow(clippy::cast_possible_truncation)] // Same case for f32 to i32
 
 //! This page is responsible for visualizing nodes, aka `StoryNodes`
-//! as well as letting the users modify them in place through the 
+//! as well as letting the users modify them in place through the
 //! editor interface when a node is clicked.
 
 use std::cell::Cell;
@@ -11,22 +11,56 @@ use cosmic::{
     Element, Renderer, Theme, iced::{
         Color, Length, Point, Radius, Rectangle, Vector, mouse,
         keyboard::{self, Modifiers},
-    }, widget::{self, canvas},
+        widget::{Stack, pin},
+    }, widget::{self, button, canvas, icon},
 };
 // use cosmic::theme::Container as ContainerStyle;
 use cosmic::iced::{Border, Background, Size};
 
 use crate::components::{
-    NodePosition, 
-    StoryNode, 
-    StoryNodeEditor, 
-    display_title, 
+    NodePosition,
+    StoryNode,
+    StoryNodeEditor,
+    ConfirmDialog,
+    display_title,
+    confirm_dialog::ConfirmDialogMessage,
+    overlay::{with_corner_button, with_overlay, toast_box, HoverTooltip, pulse_alpha, is_pulse_active},
     story_node_editor::{EditorEvent, EditorMessage},
+    unsaved_changes_dialog::{unsaved_changes_dialog, UnsavedChangesMessage},
 };
+use crate::fl;
 
 /// Responsible for providing unique UUIDs for each node
 /// so that they can be identified by other components.
 use uuid::Uuid;
+
+/// Alpha of the dimming shade behind the delete-confirmation overlay.
+const SHADE_ALPHA: f32 = 0.3;
+/// Padding from both edges for the floating "add node" button.
+const ADD_BUTTON_PADDING: f32 = 24.0;
+/// Vertical gap (beyond `ADD_BUTTON_PADDING`) between the add button and its
+/// hover tooltip floating above it.
+const ADD_BUTTON_TOOLTIP_OFFSET: f32 = 56.0;
+/// Max +/- world-space jitter applied to a newly-spawned node's position
+/// (see `spawn_jitter`), so repeated "Add Node"s don't stack perfectly on
+/// top of each other and hide one another.
+const NODE_SPAWN_JITTER: f32 = 100.0;
+
+/// Timing of the Find panel's "found it" glow ring (see `focus_node`):
+/// gently fades in, holds at full brightness for a couple seconds, then
+/// fades back out on its own — no user input needed to dismiss it.
+const NODE_GLOW_FADE_IN: Duration = Duration::from_millis(200);
+const NODE_GLOW_VISIBLE: Duration = Duration::from_millis(1500);
+const NODE_GLOW_FADE_OUT: Duration = Duration::from_millis(800);
+
+/// Derives a small pseudo-random offset from a node's own (freshly
+/// generated) id — reusing its already-random bytes instead of pulling in
+/// a `rand` dependency just for this.
+fn spawn_jitter(id: &Uuid) -> Vector {
+    let bytes = id.as_bytes();
+    let to_offset = |byte: u8| (byte as f32 / 255.0) * (2.0 * NODE_SPAWN_JITTER) - NODE_SPAWN_JITTER;
+    Vector::new(to_offset(bytes[0]), to_offset(bytes[1]))
+}
 
 /// An in-flight transition of `offset`/`zoom` from one camera state to
 /// another, driven forward by repeated `CanvasMessage::AnimationTick`
@@ -58,6 +92,32 @@ pub struct CanvasPage {
     // camera animation fields
     camera_anim: Option<CameraAnimation>,
     saved_camera: Option<(Vector, f32)>, // (offset, zoom) from before the editor opened
+
+    // hover/delete fields
+    /// The node currently under the cursor (idle, not panning/dragging), if
+    /// any — driven by `canvas::Program::update`'s own hit-testing, since
+    /// the pinned node widgets in `view()` don't get raw mouse events of
+    /// their own. Shows the hover-delete button on that node.
+    hovered_node: Option<Uuid>,
+    /// Some while a delete confirmation is pending for this node — set
+    /// either by the hover-delete button or the open editor's own Delete
+    /// button. The `ConfirmDialog` is built once at request time (rather
+    /// than fresh in `view()`) so its `view()` borrow has somewhere
+    /// long-lived (`self`) to borrow from.
+    pending_delete: Option<(Uuid, ConfirmDialog)>,
+
+    /// True while the open editor's own Close was pressed with unsaved
+    /// draft changes — shows `unsaved_changes_dialog` over the editor
+    /// instead of closing it immediately (see `EditorEvent::Closed`).
+    pending_unsaved_close: bool,
+
+    /// Drives the floating "add node" button's delayed-fade hover tooltip.
+    add_button_tooltip: HoverTooltip,
+
+    /// `Some((node_id, started_at))` while that node's Find-triggered
+    /// "found it" glow ring is fading in/holding/fading out; see
+    /// `focus_node`.
+    glow: Option<(Uuid, Instant)>,
 }
 
 /// Messages emitted by the canvas page.
@@ -83,11 +143,32 @@ pub enum CanvasMessage {
     /// re-targets) the editor for it and kicks off the click-to-edit camera
     /// animation.
     NodeClicked {id: Uuid},
+    /// The node under the cursor changed (or the cursor left every node);
+    /// see `hovered_node`.
+    NodeHoverChanged(Option<Uuid>),
+    /// The hover-delete button on a node was clicked; see `pending_delete`.
+    NodeDeleteRequested(Uuid),
+    /// Forwarded from the open `ConfirmDialog`'s own `view()`.
+    ConfirmDelete(ConfirmDialogMessage),
     /// Forwarded from the open `StoryNodeEditor`'s own `view()`.
     Editor(EditorMessage),
+    /// Forwarded from `unsaved_changes_dialog`'s own `view()`, shown when
+    /// the editor's Close was pressed with unsaved changes; see
+    /// `pending_unsaved_close`. `Save` additionally needs `AppModel` to
+    /// trigger the whole-project save, so `app/mod.rs` intercepts that
+    /// variant specifically before forwarding here.
+    UnsavedClose(UnsavedChangesMessage),
     /// One frame of an in-flight `CameraAnimation`; see `is_animating_camera`
     /// and `AppModel::subscription` for how these get scheduled.
     AnimationTick,
+    /// The cursor entered/left the floating "add node" button; see
+    /// `add_button_tooltip`.
+    AddButtonHoverEnter,
+    AddButtonHoverExit,
+    /// The canvas's on-screen bounds changed while a node's editor was
+    /// open; re-centers that node against the new size (see
+    /// `canvas::Program::update`'s resize handling).
+    EditorBoundsChanged(Size),
 
 }
 
@@ -103,6 +184,11 @@ impl Default for CanvasPage {
             last_bounds: Cell::new(Size::new(800.0, 600.0)), // fallback before first draw
             camera_anim: None,
             saved_camera: None,
+            hovered_node: None,
+            pending_delete: None,
+            pending_unsaved_close: false,
+            add_button_tooltip: HoverTooltip::default(),
+            glow: None,
         }
     }
 }
@@ -132,9 +218,47 @@ impl CanvasPage {
         self.camera_anim.is_some()
     }
 
-    pub fn view(&self) -> Element<'_, CanvasMessage> {
-        use cosmic::iced::widget::{Stack, pin};
+    /// Whether the add-button tooltip is mid-fade; used by the app's
+    /// subscription the same way as `is_animating_camera`.
+    pub fn is_add_button_tooltip_active(&self) -> bool {
+        self.add_button_tooltip.is_active()
+    }
 
+    /// Whether a Find-triggered glow ring is still fading in/holding/
+    /// fading out; used by the app's subscription the same way as
+    /// `is_animating_camera`.
+    pub fn is_glow_active(&self) -> bool {
+        self.glow.is_some_and(|(_, started)| {
+            is_pulse_active(started, NODE_GLOW_FADE_IN, NODE_GLOW_VISIBLE, NODE_GLOW_FADE_OUT)
+        })
+    }
+
+    /// Pans the camera to center node `id` on screen — keeping the current
+    /// zoom, unlike the click-to-edit animation, which also resets zoom to
+    /// 1.0 — and starts its "found it" glow ring. Used by the Find panel;
+    /// does nothing if `id` isn't a node on this canvas (e.g. a stale
+    /// result after it was deleted).
+    pub fn focus_node(&mut self, id: Uuid) {
+        let Some(node) = self.nodes.iter().find(|n| n.id == id) else { return };
+
+        let node_center = Point::new(
+            node.position.x + node.size.width / 2.0,
+            node.position.y + node.size.height / 2.0,
+        );
+        let bounds = self.last_bounds.get();
+        let screen_center = Point::new(bounds.width / 2.0, bounds.height / 2.0);
+
+        // screen = world * zoom + offset  =>  offset = screen - world * zoom
+        let target_offset = Vector::new(
+            screen_center.x - node_center.x * self.zoom,
+            screen_center.y - node_center.y * self.zoom,
+        );
+
+        self.start_camera_animation(target_offset, self.zoom);
+        self.glow = Some((id, Instant::now()));
+    }
+
+    pub fn view(&self) -> Element<'_, CanvasMessage> {
         let canvas_element = widget::canvas(self)
             .width(Length::Fill)
             .height(Length::Fill);
@@ -171,14 +295,34 @@ impl CanvasPage {
                 .x(screen.x)
                 .y(screen.y);
 
-                stack.push(node_widget)
+                let stack = stack.push(node_widget);
+
+                // A real `Button`, not a `mouse_area` — it only intercepts
+                // clicks within its own small bounds, so the rest of the
+                // node's area (and the raw canvas beneath it) still work
+                // normally for dragging/click-to-edit. Never shown while an
+                // editor is open (on top of `NodeClicked` clearing
+                // `hovered_node`, this also covers it staying visible for
+                // whichever node's editor is currently open).
+                if self.editor.is_none() && self.hovered_node == Some(node.id) {
+                    let delete_button = button::icon(icon::from_name("edit-delete-symbolic"))
+                        .extra_small()
+                        .class(cosmic::theme::Button::Destructive)
+                        .tooltip(fl!("tooltip-delete"))
+                        .on_press(CanvasMessage::NodeDeleteRequested(node.id));
+
+                    stack.push(pin(delete_button).x(screen.x + screen_width - 14.0).y(screen.y - 14.0))
+                } else {
+                    stack
+                }
             }
         ).clip(true);
 
 
-        // Now we return the stack with the canvas and all the nodes.
-        // Redraw with the editor if SOME.
-        match &self.editor {
+        // Now we build the content with the editor if SOME, plus the
+        // floating "add node" button when it's not (see below), then layer
+        // the delete-confirmation dialog over the very top of either.
+        let content: Element<'_, CanvasMessage> = match &self.editor {
             Some(editor) => {
                 // Reserve screen-space equal to `EDITOR_GAP_MULTIPLIER`x the
                 // edited node's width *at 1x zoom* for the canvas; the editor
@@ -201,11 +345,43 @@ impl CanvasPage {
                 ].into()
             },
 
-            None => widget::container(stack)
+            None => {
+                let canvas_area: Element<'_, CanvasMessage> = widget::container(stack)
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .into(),
+                    .into();
+
+                let add_button = button::icon(icon::from_name("list-add-symbolic"))
+                    .large()
+                    .icon_size(25)
+                    .class(cosmic::theme::Button::Suggested)
+                    .on_press(CanvasMessage::AddNode);
+
+                // No built-in `.tooltip(...)`: that shows instantly on
+                // hover, but this one should only fade in after a pause
+                // (see `HoverTooltip`) — so hover tracking/the tooltip label
+                // are both handled by hand instead.
+                let add_button: Element<'_, CanvasMessage> = widget::mouse_area(add_button)
+                    .on_enter(CanvasMessage::AddButtonHoverEnter)
+                    .on_exit(CanvasMessage::AddButtonHoverExit)
+                    .into();
+
+                let tooltip = toast_box(fl!("tooltip-add-node"), self.add_button_tooltip.alpha());
+
+                with_corner_button(canvas_area, add_button, tooltip, ADD_BUTTON_PADDING, ADD_BUTTON_TOOLTIP_OFFSET)
+            },
+        };
+
+        let content = match &self.pending_delete {
+            Some((_, dialog)) => with_overlay(content, dialog.view().map(CanvasMessage::ConfirmDelete), SHADE_ALPHA),
+            None => content,
+        };
+
+        if !self.pending_unsaved_close {
+            return content;
         }
+
+        with_overlay(content, unsaved_changes_dialog().map(CanvasMessage::UnsavedClose), SHADE_ALPHA)
     }
 
     pub fn update(&mut self, message: CanvasMessage) -> Option<Uuid> {
@@ -213,10 +389,11 @@ impl CanvasPage {
             CanvasMessage::AddNode => {
                 let center = self.world_center();
                 let default_node = StoryNode::default();
+                let jitter = spawn_jitter(&default_node.id);
 
                 let top_left = NodePosition {
-                    x: center.x - default_node.size.width / 2.0,
-                    y: center.y - default_node.size.height / 2.0,
+                    x: center.x - default_node.size.width / 2.0 + jitter.x,
+                    y: center.y - default_node.size.height / 2.0 + jitter.y,
                 };
 
                 let node = StoryNode { position: top_left, ..default_node };
@@ -245,6 +422,11 @@ impl CanvasPage {
 
                     self.editor = Some(StoryNodeEditor::new(id, title));
                     self.saved_camera = Some((self.offset, self.zoom));
+                    // Otherwise the last-hovered node's delete button stays
+                    // pinned (and clickable) for the rest of the editing
+                    // session, since nothing else clears `hovered_node`
+                    // while the cursor doesn't move.
+                    self.hovered_node = None;
 
                     // Target zoom is 1.0, so world and screen units coincide
                     // and `screen = world + offset`.
@@ -264,6 +446,36 @@ impl CanvasPage {
                 Some(id)
             }
 
+            CanvasMessage::NodeHoverChanged(id) => {
+                self.hovered_node = id;
+                None
+            }
+
+            CanvasMessage::NodeDeleteRequested(id) => {
+                self.request_delete(id);
+                None
+            }
+
+            CanvasMessage::ConfirmDelete(ConfirmDialogMessage::Cancel) => {
+                self.pending_delete = None;
+                None
+            }
+
+            CanvasMessage::ConfirmDelete(ConfirmDialogMessage::Confirm) => {
+                if let Some((id, _)) = self.pending_delete.take() {
+                    self.nodes.retain(|n| n.id != id);
+                    self.geo_cache.clear();
+                    self.hovered_node = None;
+
+                    // Deleted the node currently being edited — close the
+                    // editor and restore the camera, same as a normal Close.
+                    if self.editor.as_ref().is_some_and(|e| e.node_id == id) {
+                        self.close_editor();
+                    }
+                }
+                None
+            }
+
             CanvasMessage::Zoomed { at, scroll_amount } => {
                 let old_zoom = self.zoom;
                 let new_zoom = (old_zoom * (1.0 + scroll_amount * Self::ZOOM_SENSITIVITY))
@@ -272,7 +484,7 @@ impl CanvasPage {
 
                 let world_x = (at.x - self.offset.x) / old_zoom;
                 let world_y = (at.y - self.offset.y) / old_zoom;
-                
+
                 self.offset = Vector::new(
                     at.x - world_x * new_zoom,
                     at.y - world_y * new_zoom,
@@ -301,13 +513,42 @@ impl CanvasPage {
 
                         self.geo_cache.clear();
                     }
+                    EditorEvent::DeleteRequested => {
+                        self.request_delete(node_id);
+                    }
                     EditorEvent::Closed => {
-                        self.editor = None;
-                        if let Some((offset, zoom)) = self.saved_camera.take() {
-                            self.start_camera_animation(offset, zoom);
+                        // Warn instead of dropping the draft outright; the
+                        // editor stays open until the warning is resolved
+                        // (see `pending_unsaved_close` and
+                        // `CanvasMessage::UnsavedClose`).
+                        if editor.is_dirty() {
+                            self.pending_unsaved_close = true;
+                        } else {
+                            self.close_editor();
                         }
                     }
                 }
+                None
+            }
+
+            CanvasMessage::UnsavedClose(UnsavedChangesMessage::Cancel) => {
+                self.pending_unsaved_close = false;
+                None
+            }
+
+            CanvasMessage::UnsavedClose(UnsavedChangesMessage::Discard) => {
+                self.pending_unsaved_close = false;
+                self.close_editor();
+                None
+            }
+
+            CanvasMessage::UnsavedClose(UnsavedChangesMessage::Save) => {
+                // The whole-project write itself is handled by `app/mod.rs`
+                // (it intercepts this variant before forwarding here) —
+                // this only commits the draft into the node and closes.
+                self.pending_unsaved_close = false;
+                self.commit_editor();
+                self.close_editor();
                 None
             }
 
@@ -332,6 +573,53 @@ impl CanvasPage {
                         self.camera_anim = None;
                     }
                 }
+
+                if let Some((_, started)) = self.glow {
+                    if is_pulse_active(started, NODE_GLOW_FADE_IN, NODE_GLOW_VISIBLE, NODE_GLOW_FADE_OUT) {
+                        // Time-based, not offset/zoom-based, so nothing
+                        // else already clears the cache for it — the ring's
+                        // alpha wouldn't otherwise update frame-to-frame.
+                        self.geo_cache.clear();
+                    } else {
+                        self.glow = None;
+                    }
+                }
+
+                self.add_button_tooltip.tick();
+                None
+            }
+
+            CanvasMessage::AddButtonHoverEnter => {
+                self.add_button_tooltip.enter();
+                None
+            }
+
+            CanvasMessage::AddButtonHoverExit => {
+                self.add_button_tooltip.exit();
+                None
+            }
+
+            CanvasMessage::EditorBoundsChanged(new_size) => {
+                self.last_bounds.set(new_size);
+
+                // Only the vertical center ever depends on the canvas's
+                // bounds — `canvas_width` (see `NodeClicked`) is derived
+                // purely from the node's own width, so it can't go stale.
+                if let Some(editor) = &self.editor
+                    && let Some(node) = self.nodes.iter().find(|n| n.id == editor.node_id)
+                {
+                    let node_center_y = node.position.y + node.size.height / 2.0;
+                    let target_y = new_size.height / 2.0 - node_center_y;
+
+                    if let Some(anim) = &mut self.camera_anim {
+                        // A resize mid-animation retargets it instead of
+                        // fighting it frame-by-frame.
+                        anim.target_offset.y = target_y;
+                    } else {
+                        self.offset.y = target_y;
+                        self.geo_cache.clear();
+                    }
+                }
                 None
             }
         }
@@ -346,6 +634,48 @@ impl CanvasPage {
             target_offset,
             target_zoom,
         });
+    }
+
+    /// Drops the open editor and restores the pre-edit camera — the shared
+    /// second half of every path that ends an edit session (a clean Close,
+    /// Discard from the unsaved-changes warning, a Save-and-close, or the
+    /// edited node being deleted out from under it).
+    fn close_editor(&mut self) {
+        self.editor = None;
+        if let Some((offset, zoom)) = self.saved_camera.take() {
+            self.start_camera_animation(offset, zoom);
+        }
+    }
+
+    /// Writes the open editor's draft title into its node, without closing
+    /// the editor. Used both by a normal Save-and-close (paired with
+    /// `close_editor` right after) and by `AppModel::on_app_exit`'s
+    /// unsaved-changes warning, which commits every dirty editor but only
+    /// actually exits if that doesn't itself need a dialog (see
+    /// `app::project_io::save_project`).
+    pub fn commit_editor(&mut self) {
+        let Some(editor) = &mut self.editor else { return };
+        let node_id = editor.node_id;
+
+        if let EditorEvent::TitleCommitted(new_title) = editor.update(EditorMessage::Save)
+            && let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id)
+        {
+            node.title = new_title;
+            self.geo_cache.clear();
+        }
+    }
+
+    /// Builds the delete-confirmation dialog for node `id` (using its
+    /// current title) and stores it as `pending_delete`; shared by the
+    /// hover-delete button and the open editor's own Delete button.
+    fn request_delete(&mut self, id: Uuid) {
+        let title = self.nodes.iter().find(|n| n.id == id).map(|n| n.title.clone()).unwrap_or_default();
+        let dialog = ConfirmDialog::new(
+            fl!("confirm-delete-node-title"),
+            fl!("confirm-delete-node-message", title = title.as_str()),
+        );
+
+        self.pending_delete = Some((id, dialog));
     }
 
     // Outputs the current screen's coordinates to where it is
@@ -365,8 +695,8 @@ impl CanvasPage {
         self.screen_to_world(screen_center)
     }
 
-    // Separate inverse function to convert world coordinates to 
-    // screen so widgets in the view() can be positioned correctly. 
+    // Separate inverse function to convert world coordinates to
+    // screen so widgets in the view() can be positioned correctly.
     fn world_to_screen(&self, point: Point) -> Point {
     Point::new(
         point.x * self.zoom + self.offset.x,
@@ -407,7 +737,7 @@ pub struct CanvasState {
 //  Note: Do NOT use fill_text() here or render anything that has it. While it is
 //  suppported, it renders on top of all other elements and does not respect the
 //  z-ordering of the canvas. If you need to render text, use the view() instead.
-//  
+//
 //  Read more here:
 //  https://pop-os.github.io/libcosmic/cosmic/iced/daemon/program/graphics/geometry/struct.Frame.html#method.fill_text
 impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
@@ -428,12 +758,26 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
             return None;
         }
 
+        // The click-to-edit animation's target offset is computed once, from
+        // the canvas bounds *at click time* — so if those bounds change
+        // while the editor is open (a window resize or maximize/restore —
+        // both just resize the surface under the hood, plus a nav bar
+        // toggle) the edited node is left off-center unless something
+        // re-centers it. Comparing against `last_bounds` on every event
+        // (rather than matching a specific `Event::Window` variant) catches
+        // all of those the same way, without needing to know which exact
+        // event a given compositor/gesture happens to deliver.
+        if self.editor.is_some() && bounds.size() != self.last_bounds.get() {
+            return Some(canvas::Action::publish(CanvasMessage::EditorBoundsChanged(bounds.size())).and_capture());
+        }
+
         // Freeze all canvas interaction — panning, node dragging, clicking
-        // another node to open a new editor session, and zoom — while the
-        // editor is open. Otherwise those would fight the camera position
-        // the click-to-edit animation just settled on. Control returns once
-        // the editor is closed.
-        if self.editor.is_some() {
+        // another node to open a new editor session, zoom, and hover — while
+        // the editor or a delete confirmation is open. Otherwise those would
+        // fight the camera position the click-to-edit animation just settled
+        // on, or let the user keep interacting with a canvas that's about to
+        // lose a node. Control returns once both are closed.
+        if self.editor.is_some() || self.pending_delete.is_some() {
             return Some(canvas::Action::capture());
         }
 
@@ -468,7 +812,22 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
             }
             // This is where we create match arms for `state.interaction` to handle the panning logic.
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => match state.interaction {
-                CanvasInteraction::Idle => None,
+                // Idle just tracks which node (if any) is under the cursor,
+                // so `view()` can show a hover-delete button on it — see
+                // `hovered_node`. This is computed here (rather than via a
+                // `mouse_area` on each pinned node widget in `view()`)
+                // because a capturing `mouse_area` on top of the raw canvas
+                // in the `Stack` would swallow the `ButtonPressed` events
+                // this very function needs for dragging/click-to-edit.
+                CanvasInteraction::Idle => {
+                    let world_position = self.screen_to_world(cursor_position);
+                    let hovered = self.nodes.iter().rev()
+                        .find(|n| n.contains(world_position))
+                        .map(|n| n.id);
+
+                    (hovered != self.hovered_node)
+                        .then(|| canvas::Action::publish(CanvasMessage::NodeHoverChanged(hovered)))
+                }
                 // This updates practically every frame while your mouse moves on the canvas.
                 CanvasInteraction::Panning { last } => {
                     let delta = cursor_position - last;
@@ -614,10 +973,22 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
             }
 
             for node in &self.nodes {
+                // Drawn *before* the node's own opaque fill/stroke, inflated
+                // beyond its bounds, so the ring peeks out around the edges
+                // instead of being covered by it (or by the pinned title
+                // label in `view()`, which exactly matches the node's own
+                // bounds too).
+                if let Some((glow_id, started)) = self.glow
+                    && glow_id == node.id
+                    && is_pulse_active(started, NODE_GLOW_FADE_IN, NODE_GLOW_VISIBLE, NODE_GLOW_FADE_OUT)
+                {
+                    let alpha = pulse_alpha(started, NODE_GLOW_FADE_IN, NODE_GLOW_VISIBLE, NODE_GLOW_FADE_OUT);
+                    node.draw_glow(frame, alpha);
+                }
+
                 node.draw(frame); // no text, just the rounded rectangle
             }
         })]
-        
+
     }
 }
-

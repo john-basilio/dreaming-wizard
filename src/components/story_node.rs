@@ -99,7 +99,26 @@ impl StoryNode {
             Stroke::default()
                 .with_color(Color::from_rgb8(70, 70, 70))
                 .with_width(2.0),
-        );        
+        );
+    }
+
+    /// The Find panel's "found it" highlight: a ring inflated beyond the
+    /// node's own bounds (so it isn't hidden by the node's opaque fill, or
+    /// by the pinned title label in `CanvasPage::view` that exactly matches
+    /// those bounds), at `alpha` — see `CanvasPage::focus_node`.
+    pub fn draw_glow(&self, frame: &mut Frame, alpha: f32) {
+        const PADDING: f32 = 6.0;
+
+        let position = Point::new(self.position.x - PADDING, self.position.y - PADDING);
+        let size = Size::new(self.size.width + PADDING * 2.0, self.size.height + PADDING * 2.0);
+        let path = Path::rounded_rectangle(position, size, (8.0 + PADDING).into());
+
+        frame.stroke(
+            &path,
+            Stroke::default()
+                .with_color(Color::from_rgba(1.0, 1.0, 1.0, alpha))
+                .with_width(3.0),
+        );
     }
 
 }

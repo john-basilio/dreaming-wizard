@@ -4,14 +4,18 @@
 //! clicked, mirroring `StoryNodeEditor`'s role for `StoryNode`s on the
 //! canvas.
 //!
-//! Unlike `StoryNodeEditor` (which only commits its title on submit), every
-//! field here writes back to the caller as soon as it changes — the design
-//! has no explicit "Save" affordance, so the underlying `Character` is kept
-//! live-in-sync with the draft instead.
+//! Every field is buffered in a local draft and only written back to the
+//! caller when "Save" is pressed (or dropped entirely if "Delete" is
+//! pressed instead, subject to the caller's own delete confirmation) —
+//! there's no live/automatic write-through as the user types.
 
 use std::path::{Path, PathBuf};
 
-use cosmic::iced::{Alignment, Length, ContentFit, alignment::{Horizontal, Vertical}};
+use cosmic::iced::{
+    Alignment, Length, ContentFit,
+    alignment::{Horizontal, Vertical},
+    advanced::text::{Wrapping, Ellipsize, EllipsizeHeightLimit},
+};
 use cosmic::widget::{
     Column, Row,
     button, container, icon, image, mouse_area,
@@ -24,9 +28,13 @@ use uuid::Uuid;
 use crate::components::Character;
 use crate::components::project_data::resolve_avatar_path;
 use crate::fl;
-use super::display_title;
 
 const AVATAR_SIZE: f32 = 110.0;
+/// Width budget for the "Editing <name>" header label — fixed rather than
+/// `Length::Fill` so its exact size doesn't depend on content;
+/// `.ellipsize(...)` in `view()` truncates whatever doesn't fit, based on
+/// actual rendered width rather than a guessed character count.
+const HEADER_TITLE_WIDTH: f32 = 220.0;
 
 /// A modal panel for editing a single `Character`. Holds its own "draft"
 /// copy of each field, seeded from the `Character` it targets when opened.
@@ -40,8 +48,18 @@ pub struct CharacterCardEditor {
     pub draft_comment: String,
     /// No plain `String` counterpart, unlike the other drafts — `text_editor`
     /// is stateful, so this holds its `Content` directly; `.text()` is
-    /// pulled out only when reporting an `EditorEvent::DescriptionChanged`.
+    /// pulled out only when reporting an `EditorEvent::Saved`.
     description_content: text_editor::Content,
+    /// What the "Editing <name>" header shows — only refreshed on Save, so
+    /// the header doesn't reflow/jitter on every keystroke while typing.
+    saved_name: String,
+    /// Last-saved copies of the remaining fields, kept purely so `is_dirty`
+    /// can tell whether there's anything to warn about on close/app-exit —
+    /// `saved_name` alone (used for the header) isn't enough since the
+    /// other fields can change without the name changing.
+    saved_avatar: String,
+    saved_comment: String,
+    saved_description: String,
 }
 
 /// Widget-level messages from the editor's own `view()`.
@@ -61,6 +79,10 @@ pub enum EditorMessage {
     /// The system file picker opened by `ChangeAvatar` finished — `Some`
     /// with the chosen image path, or `None` if it was cancelled/failed.
     AvatarPicked(Option<PathBuf>),
+    /// The "Save" button was pressed.
+    Save,
+    /// The "Delete" button was pressed.
+    Delete,
     /// The "Close" button was pressed.
     Close,
 }
@@ -69,16 +91,19 @@ pub enum EditorMessage {
 /// (`CharactersPage`) after handling an `EditorMessage`, so it can write
 /// the change through to the actual `Character` (or drop the editor).
 pub enum EditorEvent {
-    /// Nothing for the caller to do (e.g. a cursor-only text_editor action).
+    /// Nothing for the caller to do (e.g. a draft-only keystroke).
     None,
-    /// `name` changed; the caller should persist it to the character.
-    NameChanged(String),
-    /// `comment` changed; ditto.
-    CommentChanged(String),
-    /// `description` changed; ditto.
-    DescriptionChanged(String),
-    /// `avatar` changed (a new image was picked); ditto.
-    AvatarChanged(String),
+    /// "Save" was pressed; the caller should persist every field to the
+    /// character.
+    Saved {
+        name: String,
+        avatar: String,
+        comment: String,
+        description: String,
+    },
+    /// "Delete" was pressed; the caller should confirm and, if accepted,
+    /// remove the character (the editor stays open until then).
+    DeleteRequested,
     /// The editor was closed and should be dropped.
     Closed,
 }
@@ -91,7 +116,20 @@ impl CharacterCardEditor {
             draft_avatar: character.avatar.clone(),
             draft_comment: character.comment.clone(),
             description_content: text_editor::Content::with_text(&character.description),
+            saved_name: character.name.clone(),
+            saved_avatar: character.avatar.clone(),
+            saved_comment: character.comment.clone(),
+            saved_description: character.description.clone(),
         }
+    }
+
+    /// Whether any draft field differs from what's actually saved — used to
+    /// decide whether closing (or exiting the app) should warn first.
+    pub fn is_dirty(&self) -> bool {
+        self.draft_name != self.saved_name
+            || self.draft_avatar != self.saved_avatar
+            || self.draft_comment != self.saved_comment
+            || self.description_content.text() != self.saved_description
     }
 
     /// Applies an `EditorMessage` to local draft state and reports back
@@ -99,41 +137,42 @@ impl CharacterCardEditor {
     pub fn update(&mut self, message: EditorMessage) -> EditorEvent {
         match message {
             EditorMessage::NameChanged(value) => {
-                self.draft_name = value.clone();
-                EditorEvent::NameChanged(value)
+                self.draft_name = value;
+                EditorEvent::None
             }
             EditorMessage::CommentChanged(value) => {
-                self.draft_comment = value.clone();
-                EditorEvent::CommentChanged(value)
+                self.draft_comment = value;
+                EditorEvent::None
             }
             EditorMessage::DescriptionAction(action) => {
-                let is_edit = action.is_edit();
                 self.description_content.perform(action);
-
-                if is_edit {
-                    EditorEvent::DescriptionChanged(self.description_content.text())
-                } else {
-                    EditorEvent::None
-                }
+                EditorEvent::None
             }
             // The actual dialog is dispatched by `app.rs`; nothing to do here.
             EditorMessage::ChangeAvatar => EditorEvent::None,
             EditorMessage::AvatarPicked(path) => {
-                // Same live-write-through treatment as the other fields —
-                // the caller persists this to the actual `Character` so it
-                // still shows the new avatar once the editor closes. The
-                // path is stored as given for now (no relative-to-project-
-                // file resolution or import-into-the-project-folder copy
-                // step yet — see `Character::avatar`'s doc comment).
-                match path {
-                    Some(path) => {
-                        let value = path.to_string_lossy().into_owned();
-                        self.draft_avatar = value.clone();
-                        EditorEvent::AvatarChanged(value)
-                    }
-                    None => EditorEvent::None,
+                // Draft-only, same as the other fields — the path is stored
+                // as given for now (no relative-to-project-file resolution
+                // or import-into-the-project-folder copy step yet — see
+                // `Character::avatar`'s doc comment).
+                if let Some(path) = path {
+                    self.draft_avatar = path.to_string_lossy().into_owned();
+                }
+                EditorEvent::None
+            }
+            EditorMessage::Save => {
+                self.saved_name = self.draft_name.clone();
+                self.saved_avatar = self.draft_avatar.clone();
+                self.saved_comment = self.draft_comment.clone();
+                self.saved_description = self.description_content.text();
+                EditorEvent::Saved {
+                    name: self.draft_name.clone(),
+                    avatar: self.draft_avatar.clone(),
+                    comment: self.draft_comment.clone(),
+                    description: self.saved_description.clone(),
                 }
             }
+            EditorMessage::Delete => EditorEvent::DeleteRequested,
             EditorMessage::Close => EditorEvent::Closed,
         }
     }
@@ -191,6 +230,12 @@ impl CharacterCardEditor {
                     .spacing(10)
                     .align_y(Alignment::Center),
             )
+            .push(
+                Row::new()
+                    .push(button::text(fl!("editor-save")).class(crate::components::save_button_class()).on_press(EditorMessage::Save))
+                    .push(button::text(fl!("editor-delete")).class(cosmic::theme::Button::Destructive).on_press(EditorMessage::Delete))
+                    .spacing(10),
+            )
             .spacing(12)
             .width(Length::Fill);
 
@@ -202,10 +247,12 @@ impl CharacterCardEditor {
             .push(
                 Row::new()
                     .push(
-                        title4(format!("{} {}", fl!("editor-label"), display_title(&self.draft_name, 30)))
-                            .width(Length::Fill)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None),
+                        title4(format!("{} {}", fl!("editor-label"), self.saved_name))
+                            .width(Length::Fixed(HEADER_TITLE_WIDTH))
+                            .wrapping(Wrapping::None)
+                            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1))),
                     )
+                    .push(cosmic::widget::Space::new().width(Length::Fill))
                     .push(button::text(fl!("editor-close")).on_press(EditorMessage::Close))
                     .spacing(10)
                     .align_y(Alignment::Center),
@@ -236,9 +283,9 @@ impl CharacterCardEditor {
         // the avatar/card background) instead of letting them fall through
         // the `Stack` in `nav::characters` to the dimming shade underneath,
         // which would otherwise close the editor on a click that visibly
-        // landed *on* it. Clicks that land on the Name/Comment inputs, the
-        // description editor, or the Close/avatar buttons are captured by
-        // those widgets first and never reach this wrapper at all.
+        // landed *on* it. Clicks that land on the inputs, description
+        // editor, or any button are captured by those widgets first and
+        // never reach this wrapper at all.
         mouse_area(content).into()
     }
 }

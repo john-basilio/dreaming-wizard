@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use cosmic::Element;
 
 use crate::components::overlay::{fade_alpha, toast_box, with_overlay, with_toast};
+use crate::components::unsaved_changes_dialog::unsaved_changes_dialog;
 use crate::fl;
 
 use super::{AppModel, Message};
@@ -51,6 +52,14 @@ impl AppModel {
         let content = match &self.save_dialog {
             Some(dialog) => with_overlay(content, dialog.view().map(Message::SaveDialog), SHADE_ALPHA),
             None => content,
+        };
+
+        // Highest priority of the modal overlays — shown on top of
+        // whichever page/editor was open when the app tried to exit.
+        let content = if self.pending_exit_confirm {
+            with_overlay(content, unsaved_changes_dialog().map(Message::UnsavedExit), SHADE_ALPHA)
+        } else {
+            content
         };
 
         let Some(shown_at) = self.saved_toast else {
