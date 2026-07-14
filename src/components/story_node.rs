@@ -7,6 +7,7 @@ use cosmic::widget::{
     canvas::{Frame, Path, Stroke}
 };
 use serde::{Serialize, Deserialize};
+use crate::components::story_block::{BlockContent, StoryBlock};
 use crate::fl;
 
 
@@ -19,6 +20,12 @@ pub struct StoryNode {
     pub position: NodePosition,
     pub size: NodeSize,
     pub title: String,
+    /// The passage's actual content, in reading order — see
+    /// `components::story_block`. `#[serde(default)]` so project files
+    /// saved before this field existed still load (same trick as
+    /// `ProjectFile::characters`).
+    #[serde(default)]
+    pub blocks: Vec<StoryBlock>,
 }
 
 /// A node's top-left corner, in world-space units.
@@ -50,11 +57,12 @@ impl From<NodeSize> for Size {
 
 impl Default for StoryNode {
     fn default() -> Self {
-        Self { 
-            id: Uuid::new_v4(), 
-            position: NodePosition {x: 0.0, y:0.0}, 
+        Self {
+            id: Uuid::new_v4(),
+            position: NodePosition {x: 0.0, y:0.0},
             size: NodeSize {width: 200.0, height: 100.0},
-            title: fl!("node-default-title")
+            title: fl!("node-default-title"),
+            blocks: Vec::new(),
         }
     }
 }
@@ -64,7 +72,19 @@ impl StoryNode {
     #[allow(dead_code)]
     // TODO: decide use
     pub fn new(id: Uuid, position: NodePosition, size: NodeSize, title: impl Into<String>) -> Self {
-        Self { id, position, size, title: title.into() }
+        Self { id, position, size, title: title.into(), blocks: Vec::new() }
+    }
+
+    /// Every node id this node's choice options link out to (unassigned
+    /// options skipped, dangling ids included — the caller decides what a
+    /// missing target means). This is what the canvas draws edges from.
+    pub fn outgoing_targets(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.blocks.iter()
+            .filter_map(|block| match &block.content {
+                BlockContent::Choice { options } => Some(options.iter().filter_map(|option| option.target)),
+                _ => None,
+            })
+            .flatten()
     }
 
     /// World-space rectangle occupied by this node, used for both drawing

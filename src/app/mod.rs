@@ -32,14 +32,13 @@ use cosmic::{
 
 use std::collections::HashMap;
 
-use crate::nav::{CanvasPage, CanvasMessage, CharactersPage, CharactersMessage};
+use crate::nav::{CanvasPage, CanvasMessage, CharactersPage, CharactersMessage, SettingsPage, SettingsMessage};
 
 use crate::components::{
-    ProjectData, SimplePopup, SaveProjectDialog, StoryNodeEditor, CharacterCardEditor, FindPanel, FindTarget,
+    ProjectData, SimplePopup, SaveProjectDialog, FindPanel, FindTarget,
     character_card_editor::EditorMessage,
     simple_popup::PopupMessage,
     save_project_dialog::SaveDialogMessage,
-    story_node_editor::EditorMessage as NodeEditorMessage,
     unsaved_changes_dialog::UnsavedChangesMessage,
     find_panel::{FindMessage, query_input_id},
 };
@@ -85,6 +84,9 @@ pub struct AppModel {
     /// Characters Page
     pub characters: CharactersPage,
 
+    /// Settings Page
+    pub settings: SettingsPage,
+
     /// Some while a `SimplePopup` notice is shown (e.g. a Load Project
     /// failure); see `overlays::apply_overlays` and `Message::Popup`.
     popup: Option<SimplePopup>,
@@ -109,6 +111,17 @@ pub struct AppModel {
 
     /// Some while the Find panel (Ctrl+F) is open; see `find::apply_find_panel`.
     find_panel: Option<FindPanel>,
+
+    /// True whenever the project has a change not yet reflected on disk —
+    /// drives the "*Unsaved:" project-title prefix (see
+    /// `chrome::header_center`) and the app-exit warning (`on_app_exit`).
+    /// Edits write straight through to the in-memory node/character as
+    /// they're typed (see `StoryNodeEditor`/`CharacterCardEditor`), so this
+    /// is set on every add/edit/move/delete (via `CanvasPage`/
+    /// `CharactersPage`'s own `content_dirty`, polled after every message
+    /// forwarded to them) and only cleared by a successful `save_project`,
+    /// `New`, or `Load`.
+    dirty: bool,
 }
 
 /// Which page (if any) `AppModel::context_drawer` should currently show.
@@ -122,6 +135,7 @@ pub enum DrawerPage {
 pub enum Page {
     Canvas,
     Characters,
+    Settings,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -134,6 +148,7 @@ pub enum Message {
     // Nav pages
     Canvas(CanvasMessage),
     Characters(CharactersMessage),
+    Settings(SettingsMessage),
 
     // Direct Actions
     CloseDrawer,
@@ -208,22 +223,6 @@ impl AppModel {
         }
     }
 
-    /// Whether either page's open editor has unsaved draft changes; used by
-    /// `on_app_exit` to decide whether to warn before quitting.
-    fn has_unsaved_editor(&self) -> bool {
-        self.canvas.editor.as_ref().is_some_and(StoryNodeEditor::is_dirty)
-            || self.characters.editor.as_ref().is_some_and(CharacterCardEditor::is_dirty)
-    }
-
-    /// Commits whichever editor(s) are open into their node/character —
-    /// used by the app-exit unsaved-changes warning's "Save", which (unlike
-    /// the same warning shown from an editor's own Close) doesn't already
-    /// know which single editor is open.
-    fn commit_dirty_editors(&mut self) {
-        self.canvas.commit_editor();
-        self.characters.commit_editor();
-    }
-
     /// Actually closes the main window (and, since this app has only the
     /// one, exits) — used once an exit is confirmed (nothing unsaved, or
     /// the user chose Discard/Save-then-exit).
@@ -278,6 +277,11 @@ impl cosmic::Application for AppModel {
             .data::<Page>(Page::Characters)
             .icon(icon::from_name("system-users-symbolic"));
 
+        nav.insert()
+            .text(fl!("nav-settings-id"))
+            .data::<Page>(Page::Settings)
+            .icon(icon::from_name("preferences-system-symbolic"));
+
         // Create the about widget
         let about = About::default()
             .name(fl!("app-title"))
@@ -303,6 +307,7 @@ impl cosmic::Application for AppModel {
             core,
             canvas: CanvasPage::default(),
             characters: CharactersPage::default(),
+            settings: SettingsPage::default(),
             about,
             nav,
             key_binds,
@@ -315,6 +320,7 @@ impl cosmic::Application for AppModel {
             saved_toast: None,
             pending_exit_confirm: false,
             find_panel: None,
+            dirty: false,
         };
 
         app.auto_load_last_project();
@@ -328,11 +334,11 @@ impl cosmic::Application for AppModel {
     /// Called before closing the application (the header bar's own close
     /// button — see `chrome::build_nav_bar`'s sibling, the header itself,
     /// via COSMIC's `Action::Close`). Returning `Some` overrides closing:
-    /// if either page's editor has unsaved draft changes, show the same
-    /// warning a Close-with-unsaved-changes shows, and block the exit until
-    /// it's resolved (`Message::UnsavedExit`).
+    /// if the project has unsaved changes, warn instead of quitting and
+    /// silently losing them, blocking the exit until it's resolved
+    /// (`Message::UnsavedExit`).
     fn on_app_exit(&mut self) -> Option<Self::Message> {
-        if self.has_unsaved_editor() {
+        if self.dirty {
             self.pending_exit_confirm = true;
             // The state change already happened above; this message is a
             // deliberate no-op; it only exists because `on_app_exit`'s
@@ -350,7 +356,7 @@ impl cosmic::Application for AppModel {
     }
 
     fn header_center(&self) -> Vec<Element<'_, Self::Message>> {
-        chrome::header_center(&self.project_meta.name)
+        chrome::header_center(&self.project_meta.name, self.dirty)
     }
 
     /// Enables the COSMIC application to create a nav bar with this model.
@@ -389,10 +395,15 @@ impl cosmic::Application for AppModel {
     fn view(&self) -> Element<'_, Self::Message> {
         let content: Element<_> = match self.nav.active_data::<Page>().unwrap() {
             Page::Canvas => {
-                self.canvas.view().map(Message::Canvas)
+                // The cast is threaded through to the node editor's
+                // dialogue speaker dropdowns.
+                self.canvas.view(&self.characters.characters).map(Message::Canvas)
             },
             Page::Characters => {
                 self.characters.view().map(Message::Characters)
+            },
+            Page::Settings => {
+                self.settings.view().map(Message::Settings)
             },
         };
 
@@ -464,24 +475,6 @@ impl cosmic::Application for AppModel {
             }}
 
             // Other messages
-            //
-            // Both of these are intercepted here (rather than in
-            // `CanvasPage::update`) because committing the draft is only
-            // half the job — a "Save" anywhere in this app now writes the
-            // *entire* project to disk (see `project_io::save_project`),
-            // which needs state (`config`, `project_meta`) the page doesn't
-            // have. The page-local half (committing the draft, and closing
-            // the editor for `UnsavedClose`) still happens via the normal
-            // `self.canvas.update(...)` forwarding below.
-            Message::Canvas(CanvasMessage::Editor(NodeEditorMessage::Save)) => {
-                self.canvas.update(CanvasMessage::Editor(NodeEditorMessage::Save));
-                return self.save_project();
-            }
-            Message::Canvas(CanvasMessage::UnsavedClose(UnsavedChangesMessage::Save)) => {
-                self.canvas.update(CanvasMessage::UnsavedClose(UnsavedChangesMessage::Save));
-                return self.save_project();
-            }
-
             Message::Canvas(msg) => {
                 if let Some(_node_id) = self.canvas.update(msg) {
                     self.core_mut().nav_bar_set_toggled(false);
@@ -490,6 +483,13 @@ impl cosmic::Application for AppModel {
                     // doc and `FindMessage`'s doc comment on why nothing
                     // else closes it.
                     self.find_panel = None;
+                }
+                // Covers every add/edit/move/delete `CanvasPage::update`
+                // just handled — see `CanvasPage::content_dirty`'s doc
+                // comment for why this is polled here instead of tracked
+                // per-message.
+                if self.canvas.take_content_dirty() {
+                    self.dirty = true;
                 }
             }
 
@@ -522,21 +522,9 @@ impl cosmic::Application for AppModel {
                 });
             }
 
-            // See the matching `Message::Canvas` pair above for why these
-            // two are intercepted here instead of forwarded straight
-            // through.
-            Message::Characters(CharactersMessage::Editor(EditorMessage::Save)) => {
-                self.characters.update(CharactersMessage::Editor(EditorMessage::Save));
-                return self.save_project();
-            }
-            Message::Characters(CharactersMessage::UnsavedClose(UnsavedChangesMessage::Save)) => {
-                self.characters.update(CharactersMessage::UnsavedClose(UnsavedChangesMessage::Save));
-                return self.save_project();
-            }
-
             // A Find-triggered scroll animation needs a `scrollable::
-            // snap_to` `Task` every tick it's in flight, which (like the
-            // Save pair above) only the top-level `update` can return.
+            // snap_to` `Task` every tick it's in flight, which only the
+            // top-level `update` can return.
             Message::Characters(CharactersMessage::AnimationTick) => {
                 self.characters.update(CharactersMessage::AnimationTick);
 
@@ -554,7 +542,14 @@ impl cosmic::Application for AppModel {
                     // See the matching note in `Message::Canvas` above.
                     self.find_panel = None;
                 }
+                // See the matching note in `Message::Canvas` above
+                // (`CanvasPage::content_dirty`'s doc comment).
+                if self.characters.take_content_dirty() {
+                    self.dirty = true;
+                }
             }
+
+            Message::Settings(msg) => self.settings.update(msg),
 
             Message::CloseDrawer => {
                 self.drawer_page = DrawerPage::None;
@@ -581,7 +576,7 @@ impl cosmic::Application for AppModel {
                     return match self.nav.active_data::<Page>() {
                         Some(Page::Canvas) => self.update(Message::Canvas(CanvasMessage::AddNode)),
                         Some(Page::Characters) => self.update(Message::Characters(CharactersMessage::AddCharacter)),
-                        None => Task::none(),
+                        Some(Page::Settings) | None => Task::none(),
                     };
                 }
 
@@ -635,9 +630,8 @@ impl cosmic::Application for AppModel {
             }
 
             Message::UnsavedExit(UnsavedChangesMessage::Save) => {
-                self.commit_dirty_editors();
-                let save_task = self.save_project();
                 self.pending_exit_confirm = false;
+                let save_task = self.save_project();
 
                 // Saving a brand-new project opens the name/location dialog
                 // instead of writing immediately — don't force an exit out

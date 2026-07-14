@@ -18,7 +18,12 @@ use std::path::Path;
 
 use cosmic::{
     Element,
-    iced::{ContentFit, Length, alignment::{Horizontal, Vertical}, mouse, widget::{Stack, pin}},
+    iced::{
+        ContentFit, Length,
+        alignment::{Horizontal, Vertical},
+        advanced::text::{Wrapping, Ellipsize, EllipsizeHeightLimit},
+        mouse, widget::{Stack, pin},
+    },
     widget::{Column, button, container, icon, image, mouse_area, text},
 };
 
@@ -65,10 +70,16 @@ pub fn character_card<'a, Message: Clone + 'static>(
         .align_y(Vertical::Center)
         .class(cosmic::theme::Container::Card);
 
+    let name_label = text::body(name.into())
+        .width(Length::Fill)
+        .center()
+        .wrapping(Wrapping::Word)
+        .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(2)));
+
     let card = container(
         Column::new()
             .push(avatar)
-            .push(text::body(name.into()))
+            .push(name_label)
             .align_x(Horizontal::Center)
             .spacing(12)
     )

@@ -144,15 +144,24 @@ pub(super) fn header_start(key_binds: &HashMap<menu::KeyBind, MenuAction>) -> Ve
 }
 
 /// Builds the header's centered title (`project_name`, or a fallback if the
-/// project hasn't been named yet).
-pub(super) fn header_center(project_name: &str) -> Vec<Element<'static, Message>> {
+/// project hasn't been named yet). `is_dirty` swaps the usual "Project:"
+/// prefix for "*Unsaved:" whenever there's a change not yet reflected on
+/// disk (see `AppModel::is_project_dirty`) — it disappears again the
+/// moment everything's saved.
+pub(super) fn header_center(project_name: &str, is_dirty: bool) -> Vec<Element<'static, Message>> {
     let display_name = if project_name.is_empty() {
         fl!("project-title-fallback")
     } else {
         project_name.to_string()
     };
 
-    let title = text::heading(format!("{} {}", fl!("project_title_prefix"), display_name))
+    let prefix = if is_dirty {
+        fl!("project-title-unsaved-prefix")
+    } else {
+        fl!("project_title_prefix")
+    };
+
+    let title = text::heading(format!("{prefix} {display_name}"))
         .width(Length::Fill)
         .center()
         .wrapping(Wrapping::None)

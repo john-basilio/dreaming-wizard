@@ -11,6 +11,8 @@
 pub mod story_node;
 pub use story_node::{StoryNode, NodePosition};
 
+pub mod story_block;
+
 pub mod story_node_editor;
 pub use story_node_editor::StoryNodeEditor;
 

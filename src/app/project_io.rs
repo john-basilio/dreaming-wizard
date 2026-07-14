@@ -47,6 +47,9 @@ impl AppModel {
         self.canvas.offset = Vector::new(project.canvas.last_camera.0, project.canvas.last_camera.1);
         self.characters.characters = project.characters.characters;
         self.characters.editor = None;
+
+        // Freshly loaded from disk — by definition nothing's unsaved yet.
+        self.dirty = false;
     }
 
     /// Reads and applies a project file from `path`. Returns whether it
@@ -144,6 +147,9 @@ impl AppModel {
                 self.config.last_project_path = None;
                 self.save_config();
 
+                // A blank project has nothing unsaved yet.
+                self.dirty = false;
+
                 self.update_title()
             }
 
@@ -170,13 +176,11 @@ impl AppModel {
 
     /// Persists the *entire* project to disk — straight to the remembered
     /// path if one exists, or via the name/location dialog for a
-    /// brand-new project. This is what the File menu's Save has always
-    /// done; both editors' Save buttons now trigger the same thing (rather
-    /// than only committing their own node/character in memory), since a
-    /// per-editor save that never reached disk would be indistinguishable
-    /// from an unsaved draft after a crash or `New`/`Load`. The File menu's
-    /// Save is still useful on its own for changes an editor never touches
-    /// — e.g. added/deleted nodes or characters.
+    /// brand-new project. This is the *only* way anything reaches disk:
+    /// the editors just write straight through to the in-memory node/
+    /// character as the user types (see `StoryNodeEditor`/
+    /// `CharacterCardEditor`), but never save on their own — only the File
+    /// menu's Save/Ctrl+S does that.
     pub(super) fn save_project(&mut self) -> Task<cosmic::Action<Message>> {
         let now = jiff::Timestamp::now().to_string();
 
@@ -199,6 +203,7 @@ impl AppModel {
             // dialog; just a brief "Saved" toast.
             self.write_project_file(&PathBuf::from(path));
             self.show_saved_toast();
+            self.dirty = false;
         } else {
             // First save of a brand-new project: open the name/location
             // dialog instead of saving immediately.
@@ -280,6 +285,7 @@ impl AppModel {
                         }
                         self.write_project_file(&path.join("project.json"));
                         self.show_saved_toast();
+                        self.dirty = false;
                     }
                     Err(err) => {
                         eprintln!("failed to create project folder at {}: {err}", path.display());
