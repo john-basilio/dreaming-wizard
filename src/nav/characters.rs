@@ -19,7 +19,6 @@ use crate::components::{Character, CharacterCardEditor, ConfirmDialog, character
 use crate::components::character_card_editor::{EditorEvent, EditorMessage};
 use crate::components::confirm_dialog::ConfirmDialogMessage;
 use crate::components::overlay::{with_corner_button, with_overlay, toast_box, HoverTooltip, pulse_alpha, is_pulse_active};
-use crate::components::unsaved_changes_dialog::{unsaved_changes_dialog, UnsavedChangesMessage};
 use crate::fl;
 
 /// Widget `Id` of the character list's `scrollable`, so a Find-triggered
@@ -71,11 +70,6 @@ pub struct CharactersPage {
     /// long-lived (`self`) to borrow from.
     pending_delete: Option<(Uuid, ConfirmDialog)>,
 
-    /// True while the open editor's own Close was pressed with unsaved
-    /// draft changes — shows `unsaved_changes_dialog` over the editor
-    /// instead of closing it immediately (see `EditorEvent::Closed`).
-    pending_unsaved_close: bool,
-
     /// Drives the floating "add character" button's delayed-fade hover
     /// tooltip.
     add_button_tooltip: HoverTooltip,
@@ -97,6 +91,13 @@ pub struct CharactersPage {
     /// Find-triggered "found it" glow ring is fading in/holding/fading out;
     /// see `focus_character`.
     glow: Option<(Uuid, Instant)>,
+
+    /// Set whenever a character was added, edited, or deleted since the
+    /// last time this was taken — polled by `AppModel` (via
+    /// `take_content_dirty`) after every message it forwards here, to
+    /// update its own project-wide "is anything unsaved" flag. Doesn't
+    /// reset itself; the caller must consume it.
+    content_dirty: bool,
 }
 
 impl Default for CharactersPage {
@@ -111,12 +112,12 @@ impl Default for CharactersPage {
             editor: None,
             hovered: None,
             pending_delete: None,
-            pending_unsaved_close: false,
             add_button_tooltip: HoverTooltip::default(),
             scroll_relative_y: 0.0,
             scroll_anim: None,
             pending_scroll: None,
             glow: None,
+            content_dirty: false,
         }
     }
 }
@@ -131,12 +132,12 @@ impl CharactersPage {
             editor: None,
             hovered: None,
             pending_delete: None,
-            pending_unsaved_close: false,
             add_button_tooltip: HoverTooltip::default(),
             scroll_relative_y: 0.0,
             scroll_anim: None,
             pending_scroll: None,
             glow: None,
+            content_dirty: false,
         }
     }
 
@@ -188,6 +189,13 @@ impl CharactersPage {
     pub fn take_pending_scroll(&mut self) -> Option<f32> {
         self.pending_scroll.take()
     }
+
+    /// Takes whatever `content_dirty` has accumulated since the last time
+    /// this was called — `AppModel` folds it into its own project-wide
+    /// dirty flag after every message it forwards here.
+    pub fn take_content_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.content_dirty)
+    }
 }
 
 /// Messages emitted by the Characters page.
@@ -218,12 +226,6 @@ pub enum CharactersMessage {
     Scrolled(Viewport),
     /// Forwarded from the open `CharacterCardEditor`'s own `view()`.
     Editor(EditorMessage),
-    /// Forwarded from `unsaved_changes_dialog`'s own `view()`, shown when
-    /// the editor's Close was pressed with unsaved changes; see
-    /// `pending_unsaved_close`. `Save` additionally needs `AppModel` to
-    /// trigger the whole-project save, so `app/mod.rs` intercepts that
-    /// variant specifically before forwarding here.
-    UnsavedClose(UnsavedChangesMessage),
 }
 
 impl CharactersPage {
@@ -339,16 +341,10 @@ impl CharactersPage {
             None => list,
         };
 
-        let content = match &self.pending_delete {
+        match &self.pending_delete {
             Some((_, dialog)) => with_overlay(content, dialog.view().map(CharactersMessage::ConfirmDelete), SHADE_ALPHA),
             None => content,
-        };
-
-        if !self.pending_unsaved_close {
-            return content;
         }
-
-        with_overlay(content, unsaved_changes_dialog().map(CharactersMessage::UnsavedClose), SHADE_ALPHA)
     }
 
     /// Applies a `CharactersMessage`. Returns `Some(id)` when a card was
@@ -392,6 +388,7 @@ impl CharactersPage {
                 if let Some((id, _)) = self.pending_delete.take() {
                     self.characters.retain(|c| c.id != id);
                     self.hovered = None;
+                    self.content_dirty = true;
 
                     if self.editor.as_ref().is_some_and(|e| e.character_id == id) {
                         self.close_editor();
@@ -402,6 +399,7 @@ impl CharactersPage {
 
             CharactersMessage::AddCharacter => {
                 self.characters.push(Character { name: fl!("character-default-name"), ..Character::default() });
+                self.content_dirty = true;
                 None
             }
 
@@ -461,81 +459,47 @@ impl CharactersPage {
 
                 match event {
                     EditorEvent::None => {}
-                    EditorEvent::Saved { name, avatar, comment, description } => {
+                    EditorEvent::NameChanged(name) => {
                         if let Some(character) = self.characters.iter_mut().find(|c| c.id == character_id) {
                             character.name = name;
-                            character.avatar = avatar;
+                        }
+                        self.content_dirty = true;
+                    }
+                    EditorEvent::CommentChanged(comment) => {
+                        if let Some(character) = self.characters.iter_mut().find(|c| c.id == character_id) {
                             character.comment = comment;
+                        }
+                        self.content_dirty = true;
+                    }
+                    EditorEvent::AvatarChanged(avatar) => {
+                        if let Some(character) = self.characters.iter_mut().find(|c| c.id == character_id) {
+                            character.avatar = avatar;
+                        }
+                        self.content_dirty = true;
+                    }
+                    EditorEvent::DescriptionChanged(description) => {
+                        if let Some(character) = self.characters.iter_mut().find(|c| c.id == character_id) {
                             character.description = description;
                         }
+                        self.content_dirty = true;
                     }
                     EditorEvent::DeleteRequested => {
                         self.request_delete(character_id);
                     }
                     EditorEvent::Closed => {
-                        // Warn instead of dropping the draft outright; the
-                        // editor stays open until the warning is resolved
-                        // (see `pending_unsaved_close` and
-                        // `CharactersMessage::UnsavedClose`).
-                        if editor.is_dirty() {
-                            self.pending_unsaved_close = true;
-                        } else {
-                            self.close_editor();
-                        }
+                        self.close_editor();
                     }
                 }
-                None
-            }
-
-            CharactersMessage::UnsavedClose(UnsavedChangesMessage::Cancel) => {
-                self.pending_unsaved_close = false;
-                None
-            }
-
-            CharactersMessage::UnsavedClose(UnsavedChangesMessage::Discard) => {
-                self.pending_unsaved_close = false;
-                self.close_editor();
-                None
-            }
-
-            CharactersMessage::UnsavedClose(UnsavedChangesMessage::Save) => {
-                // The whole-project write itself is handled by `app/mod.rs`
-                // (it intercepts this variant before forwarding here) —
-                // this only commits the draft into the character and closes.
-                self.pending_unsaved_close = false;
-                self.commit_editor();
-                self.close_editor();
                 None
             }
         }
     }
 
     /// Drops the open editor — the shared second half of every path that
-    /// ends an edit session (a clean Close, Discard from the
-    /// unsaved-changes warning, a Save-and-close, or the edited character
-    /// being deleted out from under it).
+    /// ends an edit session (a clean Close, or the edited character being
+    /// deleted out from under it).
     fn close_editor(&mut self) {
         self.editor = None;
-    }
-
-    /// Writes the open editor's draft fields into its character, without
-    /// closing the editor. Used both by a normal Save-and-close (paired
-    /// with `close_editor` right after) and by `AppModel::on_app_exit`'s
-    /// unsaved-changes warning, which commits every dirty editor but only
-    /// actually exits if that doesn't itself need a dialog (see
-    /// `app::project_io::save_project`).
-    pub fn commit_editor(&mut self) {
-        let Some(editor) = &mut self.editor else { return };
-        let character_id = editor.character_id;
-
-        if let EditorEvent::Saved { name, avatar, comment, description } = editor.update(EditorMessage::Save)
-            && let Some(character) = self.characters.iter_mut().find(|c| c.id == character_id)
-        {
-            character.name = name;
-            character.avatar = avatar;
-            character.comment = comment;
-            character.description = description;
-        }
     }
 
     /// Builds the delete-confirmation dialog for character `id` (using its

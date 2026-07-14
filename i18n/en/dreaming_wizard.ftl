@@ -25,6 +25,9 @@ item_find = Find
 
 # Header Center: Title
 project_title_prefix = Project:
+# Header Center: Title prefix shown instead of the above while there's an
+# unsaved change (see AppModel::is_project_dirty)
+project-title-unsaved-prefix = *Unsaved:
 # Header Center: Fallback title shown before the project has been saved
 project-title-fallback = New Project
 # Default project name/author saved when the user hasn't set one yet
@@ -84,8 +87,15 @@ toast-saved = Saved ✓
 nav-canvas-id = Canvas
 # Character tab
 nav-characters-id = Characters
+# Settings tab
+nav-settings-id = Settings
 
 # <--------------------->
+
+## Settings page
+
+# Placeholder shown until the page actually has settings to configure
+settings-placeholder = Nothing to configure yet.
 
 ## Canvas page
 
@@ -94,12 +104,16 @@ node-default-title = New Node
 
 # Editor: Label
 editor-label = Editing
-# Editor: Save (shared by the story node and character card editors)
-editor-save = Save
 # Editor: Delete (shared by the story node and character card editors)
 editor-delete = Delete
 # Editor: Close
 editor-close = Close
+# Editor: enters title-editing mode (story node editor header)
+editor-edit = Edit
+# Editor: commits the title being edited
+editor-save = Save
+# Editor: discards the title being edited
+editor-cancel = Cancel
 # Editor: Title label
 editor-title-label = Title:
 # Editor: Title input placeholder
@@ -107,6 +121,38 @@ editor-title-placeholder = Write node's title here...
 
 # Floating "+" button tooltip on the canvas page
 tooltip-add-node = Add Node
+
+## Story node editor: content blocks
+
+# Block kind labels — each block card's header, and the add-block buttons
+block-narration = Narration
+block-dialogue = Dialogue
+block-choice = Choice
+block-directive = Directive
+block-note = Note
+
+# The narrator persona label shown under narration blocks' fixed avatar
+block-narrator-label = Narrator
+
+# Prose body placeholders
+block-narration-placeholder = Write narration here...
+block-dialogue-placeholder = Write the spoken line here...
+block-note-placeholder = Write an author-only note here (never shown to players)...
+
+# Shared "nothing selected" entry of the inline speaker/target dropdowns
+dropdown-none = (None)
+
+# Directive: command/argument input placeholders
+block-directive-command-placeholder = command
+block-directive-argument-placeholder = argument
+
+# Choice: option label placeholder and the add-option button
+choice-option-placeholder = Choice text...
+choice-add-option = Add option
+
+# Block bubble button tooltips
+tooltip-remove-block = Remove block
+tooltip-remove-option = Remove option
 
 ## Characters page
 

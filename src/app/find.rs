@@ -39,7 +39,14 @@ impl AppModel {
 
         match panel.target {
             FindTarget::Node => self.canvas.nodes.iter()
-                .filter(|node| query.is_empty() || node.title.to_lowercase().contains(&query))
+                .filter(|node| {
+                    query.is_empty()
+                        || node.title.to_lowercase().contains(&query)
+                        // Content counts too: a node whose blocks (prose,
+                        // choice labels, directives) mention the query is a
+                        // match, still labeled by its title.
+                        || node.blocks.iter().any(|block| block.matches_query(&query))
+                })
                 .map(|node| FindResult { id: node.id, label: node.title.clone() })
                 .collect(),
             FindTarget::Character => self.characters.characters.iter()

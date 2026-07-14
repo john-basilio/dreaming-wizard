@@ -7,3 +7,6 @@ pub use canvas::{CanvasPage, CanvasMessage};
 
 pub mod characters;
 pub use characters::{CharactersPage, CharactersMessage};
+
+pub mod settings;
+pub use settings::{SettingsPage, SettingsMessage};

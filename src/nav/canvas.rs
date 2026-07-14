@@ -18,6 +18,7 @@ use cosmic::{
 use cosmic::iced::{Border, Background, Size};
 
 use crate::components::{
+    Character,
     NodePosition,
     StoryNode,
     StoryNodeEditor,
@@ -26,7 +27,6 @@ use crate::components::{
     confirm_dialog::ConfirmDialogMessage,
     overlay::{with_corner_button, with_overlay, toast_box, HoverTooltip, pulse_alpha, is_pulse_active},
     story_node_editor::{EditorEvent, EditorMessage},
-    unsaved_changes_dialog::{unsaved_changes_dialog, UnsavedChangesMessage},
 };
 use crate::fl;
 
@@ -45,6 +45,17 @@ const ADD_BUTTON_TOOLTIP_OFFSET: f32 = 56.0;
 /// (see `spawn_jitter`), so repeated "Add Node"s don't stack perfectly on
 /// top of each other and hide one another.
 const NODE_SPAWN_JITTER: f32 = 100.0;
+
+/// Bend range for story-graph edge curves (the edge pass in `draw`): how
+/// far, in world units, an edge's control points extend past its
+/// endpoints along the routing axis — half the span, clamped to these
+/// bounds so short hops still visibly curve and long ones don't balloon.
+const EDGE_MIN_BEND: f32 = 30.0;
+const EDGE_MAX_BEND: f32 = 120.0;
+/// Sideways shift of an edge's anchors from the node-edge centers, signed
+/// by travel direction — a reciprocal pair (A→B and B→A) lands on two
+/// parallel lanes instead of overlapping/tangling.
+const EDGE_LANE_OFFSET: f32 = 14.0;
 
 /// Timing of the Find panel's "found it" glow ring (see `focus_node`):
 /// gently fades in, holds at full brightness for a couple seconds, then
@@ -106,11 +117,6 @@ pub struct CanvasPage {
     /// long-lived (`self`) to borrow from.
     pending_delete: Option<(Uuid, ConfirmDialog)>,
 
-    /// True while the open editor's own Close was pressed with unsaved
-    /// draft changes — shows `unsaved_changes_dialog` over the editor
-    /// instead of closing it immediately (see `EditorEvent::Closed`).
-    pending_unsaved_close: bool,
-
     /// Drives the floating "add node" button's delayed-fade hover tooltip.
     add_button_tooltip: HoverTooltip,
 
@@ -118,6 +124,13 @@ pub struct CanvasPage {
     /// "found it" glow ring is fading in/holding/fading out; see
     /// `focus_node`.
     glow: Option<(Uuid, Instant)>,
+
+    /// Set whenever a node was added, moved, edited, or deleted since the
+    /// last time this was taken — polled by `AppModel` (via
+    /// `take_content_dirty`) after every message it forwards here, to
+    /// update its own project-wide "is anything unsaved" flag. Doesn't
+    /// reset itself; the caller must consume it.
+    content_dirty: bool,
 }
 
 /// Messages emitted by the canvas page.
@@ -152,12 +165,6 @@ pub enum CanvasMessage {
     ConfirmDelete(ConfirmDialogMessage),
     /// Forwarded from the open `StoryNodeEditor`'s own `view()`.
     Editor(EditorMessage),
-    /// Forwarded from `unsaved_changes_dialog`'s own `view()`, shown when
-    /// the editor's Close was pressed with unsaved changes; see
-    /// `pending_unsaved_close`. `Save` additionally needs `AppModel` to
-    /// trigger the whole-project save, so `app/mod.rs` intercepts that
-    /// variant specifically before forwarding here.
-    UnsavedClose(UnsavedChangesMessage),
     /// One frame of an in-flight `CameraAnimation`; see `is_animating_camera`
     /// and `AppModel::subscription` for how these get scheduled.
     AnimationTick,
@@ -186,9 +193,9 @@ impl Default for CanvasPage {
             saved_camera: None,
             hovered_node: None,
             pending_delete: None,
-            pending_unsaved_close: false,
             add_button_tooltip: HoverTooltip::default(),
             glow: None,
+            content_dirty: false,
         }
     }
 }
@@ -258,7 +265,10 @@ impl CanvasPage {
         self.glow = Some((id, Instant::now()));
     }
 
-    pub fn view(&self) -> Element<'_, CanvasMessage> {
+    /// `characters` is the Characters tab's cast, only threaded through to
+    /// the open editor's dialogue speaker dropdowns (see
+    /// `StoryNodeEditor::view`).
+    pub fn view(&self, characters: &[Character]) -> Element<'_, CanvasMessage> {
         let canvas_element = widget::canvas(self)
             .width(Length::Fill)
             .height(Length::Fill);
@@ -341,7 +351,7 @@ impl CanvasPage {
                     widget::container(stack)
                         .width(Length::Fixed(node_width * Self::EDITOR_GAP_MULTIPLIER))
                         .height(Length::Fill),
-                    editor.view().map(CanvasMessage::Editor),
+                    editor.view(characters, &self.nodes).map(CanvasMessage::Editor),
                 ].into()
             },
 
@@ -372,16 +382,10 @@ impl CanvasPage {
             },
         };
 
-        let content = match &self.pending_delete {
+        match &self.pending_delete {
             Some((_, dialog)) => with_overlay(content, dialog.view().map(CanvasMessage::ConfirmDelete), SHADE_ALPHA),
             None => content,
-        };
-
-        if !self.pending_unsaved_close {
-            return content;
         }
-
-        with_overlay(content, unsaved_changes_dialog().map(CanvasMessage::UnsavedClose), SHADE_ALPHA)
     }
 
     pub fn update(&mut self, message: CanvasMessage) -> Option<Uuid> {
@@ -399,6 +403,7 @@ impl CanvasPage {
                 let node = StoryNode { position: top_left, ..default_node };
                 self.nodes.push(node);
                 self.geo_cache.clear();
+                self.content_dirty = true;
                 None
             },
             CanvasMessage::Panned(delta) => {
@@ -410,17 +415,18 @@ impl CanvasPage {
                 if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
                     node.position.x += delta.x;
                     node.position.y += delta.y;
+                    self.content_dirty = true;
                 }
                 self.geo_cache.clear();
                 None
             },
             CanvasMessage::NodeClicked { id } => {
                 if let Some(node) = self.nodes.iter().find(|n| n.id == id) {
-                    let title = node.title.clone();
+                    let editor = StoryNodeEditor::new(node);
                     let size = node.size.clone();
                     let position = node.position.clone();
 
-                    self.editor = Some(StoryNodeEditor::new(id, title));
+                    self.editor = Some(editor);
                     self.saved_camera = Some((self.offset, self.zoom));
                     // Otherwise the last-hovered node's delete button stays
                     // pinned (and clickable) for the rest of the editing
@@ -466,6 +472,7 @@ impl CanvasPage {
                     self.nodes.retain(|n| n.id != id);
                     self.geo_cache.clear();
                     self.hovered_node = None;
+                    self.content_dirty = true;
 
                     // Deleted the node currently being edited — close the
                     // editor and restore the camera, same as a normal Close.
@@ -506,49 +513,37 @@ impl CanvasPage {
 
                 match event {
                     EditorEvent::None => {}
-                    EditorEvent::TitleCommitted(new_title) => {
+                    EditorEvent::TitleChanged(new_title) => {
                         if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
                             node.title = new_title;
                         }
 
                         self.geo_cache.clear();
+                        self.content_dirty = true;
                     }
-                    EditorEvent::DeleteRequested => {
-                        self.request_delete(node_id);
-                    }
-                    EditorEvent::Closed => {
-                        // Warn instead of dropping the draft outright; the
-                        // editor stays open until the warning is resolved
-                        // (see `pending_unsaved_close` and
-                        // `CanvasMessage::UnsavedClose`).
-                        if editor.is_dirty() {
-                            self.pending_unsaved_close = true;
-                        } else {
-                            self.close_editor();
+                    EditorEvent::BlocksChanged(blocks) => {
+                        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
+                            node.blocks = blocks;
                         }
+
+                        // Choice targets may have changed, and those are
+                        // drawn (as edges) by the cached geometry pass.
+                        self.geo_cache.clear();
+                        self.content_dirty = true;
+                    }
+                    EditorEvent::Closed(pending_blocks) => {
+                        // Closing auto-commits an in-flight prose draft;
+                        // write it through like any other block change.
+                        if let Some(blocks) = pending_blocks {
+                            if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
+                                node.blocks = blocks;
+                            }
+                            self.geo_cache.clear();
+                            self.content_dirty = true;
+                        }
+                        self.close_editor();
                     }
                 }
-                None
-            }
-
-            CanvasMessage::UnsavedClose(UnsavedChangesMessage::Cancel) => {
-                self.pending_unsaved_close = false;
-                None
-            }
-
-            CanvasMessage::UnsavedClose(UnsavedChangesMessage::Discard) => {
-                self.pending_unsaved_close = false;
-                self.close_editor();
-                None
-            }
-
-            CanvasMessage::UnsavedClose(UnsavedChangesMessage::Save) => {
-                // The whole-project write itself is handled by `app/mod.rs`
-                // (it intercepts this variant before forwarding here) —
-                // this only commits the draft into the node and closes.
-                self.pending_unsaved_close = false;
-                self.commit_editor();
-                self.close_editor();
                 None
             }
 
@@ -647,22 +642,11 @@ impl CanvasPage {
         }
     }
 
-    /// Writes the open editor's draft title into its node, without closing
-    /// the editor. Used both by a normal Save-and-close (paired with
-    /// `close_editor` right after) and by `AppModel::on_app_exit`'s
-    /// unsaved-changes warning, which commits every dirty editor but only
-    /// actually exits if that doesn't itself need a dialog (see
-    /// `app::project_io::save_project`).
-    pub fn commit_editor(&mut self) {
-        let Some(editor) = &mut self.editor else { return };
-        let node_id = editor.node_id;
-
-        if let EditorEvent::TitleCommitted(new_title) = editor.update(EditorMessage::Save)
-            && let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id)
-        {
-            node.title = new_title;
-            self.geo_cache.clear();
-        }
+    /// Takes whatever `content_dirty` has accumulated since the last time
+    /// this was called — `AppModel` folds it into its own project-wide
+    /// dirty flag after every message it forwards here.
+    pub fn take_content_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.content_dirty)
     }
 
     /// Builds the delete-confirmation dialog for node `id` (using its
@@ -970,6 +954,96 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
                     .with_color(grid_color)
                     .with_width(grid_width)
                 );
+            }
+
+            // Story-graph edges: one arrow per assigned choice-option
+            // target, drawn before the nodes so the curves pass under
+            // their opaque fills. Dangling targets (deleted nodes) and
+            // self-loops draw nothing.
+            let edge_color = Color::from_rgb8(120, 120, 130);
+            for node in &self.nodes {
+                for target_id in node.outgoing_targets() {
+                    if target_id == node.id {
+                        continue;
+                    }
+                    let Some(target) = self.nodes.iter().find(|n| n.id == target_id) else {
+                        continue;
+                    };
+
+                    let source_center = Point::new(
+                        node.position.x + node.size.width / 2.0,
+                        node.position.y + node.size.height / 2.0,
+                    );
+                    let target_center = Point::new(
+                        target.position.x + target.size.width / 2.0,
+                        target.position.y + target.size.height / 2.0,
+                    );
+                    let dx = target_center.x - source_center.x;
+                    let dy = target_center.y - source_center.y;
+
+                    // Route along the dominant axis, leaving/entering the
+                    // facing node edges, with the anchors shifted sideways
+                    // by travel direction (EDGE_LANE_OFFSET) — so A→B and
+                    // B→A run on two parallel lanes instead of tangling,
+                    // however the nodes are arranged. `dir` is the
+                    // axis-aligned travel direction at both endpoints.
+                    let (start, end, dir) = if dy.abs() >= dx.abs() {
+                        let sign = if dy >= 0.0 { 1.0 } else { -1.0 };
+                        let start = Point::new(
+                            source_center.x + sign * EDGE_LANE_OFFSET,
+                            if sign > 0.0 { node.position.y + node.size.height } else { node.position.y },
+                        );
+                        let end = Point::new(
+                            target_center.x + sign * EDGE_LANE_OFFSET,
+                            if sign > 0.0 { target.position.y } else { target.position.y + target.size.height },
+                        );
+                        (start, end, Vector::new(0.0, sign))
+                    } else {
+                        let sign = if dx >= 0.0 { 1.0 } else { -1.0 };
+                        let start = Point::new(
+                            if sign > 0.0 { node.position.x + node.size.width } else { node.position.x },
+                            source_center.y + sign * EDGE_LANE_OFFSET,
+                        );
+                        let end = Point::new(
+                            if sign > 0.0 { target.position.x } else { target.position.x + target.size.width },
+                            target_center.y + sign * EDGE_LANE_OFFSET,
+                        );
+                        (start, end, Vector::new(sign, 0.0))
+                    };
+
+                    // An S-curve that leaves and arrives along `dir`; the
+                    // control points sit `bend` past each endpoint on the
+                    // routing axis.
+                    let span = (dir.x * (end.x - start.x) + dir.y * (end.y - start.y)).abs();
+                    let bend = (span / 2.0).clamp(EDGE_MIN_BEND, EDGE_MAX_BEND);
+                    let curve = canvas::Path::new(|builder| {
+                        builder.move_to(start);
+                        builder.bezier_curve_to(
+                            Point::new(start.x + dir.x * bend, start.y + dir.y * bend),
+                            Point::new(end.x - dir.x * bend, end.y - dir.y * bend),
+                            end,
+                        );
+                    });
+                    frame.stroke(
+                        &curve,
+                        canvas::Stroke::default()
+                            .with_color(edge_color)
+                            .with_width(1.5),
+                    );
+
+                    // Arrowhead at `end`, pointing along `dir` — the last
+                    // control point sits straight behind the tip, so the
+                    // curve always arrives axis-aligned.
+                    let base = Point::new(end.x - dir.x * 9.0, end.y - dir.y * 9.0);
+                    let perp = Vector::new(-dir.y, dir.x);
+                    let arrow = canvas::Path::new(|builder| {
+                        builder.move_to(end);
+                        builder.line_to(Point::new(base.x + perp.x * 5.0, base.y + perp.y * 5.0));
+                        builder.line_to(Point::new(base.x - perp.x * 5.0, base.y - perp.y * 5.0));
+                        builder.close();
+                    });
+                    frame.fill(&arrow, edge_color);
+                }
             }
 
             for node in &self.nodes {
