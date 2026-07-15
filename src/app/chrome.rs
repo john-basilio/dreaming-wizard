@@ -45,6 +45,8 @@ pub enum ActionMenuAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HelpMenuAction {
     About,
+    /// Jumps to the Preferences page and highlights its Language setting.
+    Language,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,10 +136,13 @@ pub(super) fn header_start(key_binds: &HashMap<menu::KeyBind, MenuAction>) -> Ve
         menu::root(fl!("hs_help")).apply(Element::from),
         menu::items(
             key_binds,
-            vec![menu::Item::Button(fl!("item_about"), None, MenuAction::Help(HelpMenuAction::About))],
+            vec![
+                menu::Item::Button(fl!("item_language"), None, MenuAction::Help(HelpMenuAction::Language)),
+                menu::Item::Button(fl!("item_about"), None, MenuAction::Help(HelpMenuAction::About)),
+            ],
         ),
     )])
-    // "About" has no keybind hint, so it only needs to fit the label.
+    // Neither item has a keybind hint, so this only needs to fit labels.
     .item_width(ItemWidth::Uniform(160));
 
     vec![file_menu.into(), action_menu.into(), help_menu.into()]

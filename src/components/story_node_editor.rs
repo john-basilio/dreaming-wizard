@@ -14,9 +14,15 @@ use cosmic::widget::{
 use cosmic::Element;
 use uuid::Uuid;
 
-use crate::components::{Character, StoryNode, display_title};
+use crate::components::{Character, ConfirmDialog, StoryNode, display_title};
+use crate::components::confirm_dialog::ConfirmDialogMessage;
+use crate::components::overlay::with_overlay;
 use crate::components::story_block::{BlockContent, BlockKind, ChoiceOption, StoryBlock};
 use crate::fl;
+
+/// Alpha of the dimming shade behind the block delete-confirmation
+/// overlay; same value as the canvas/characters pages use.
+const SHADE_ALPHA: f32 = 0.3;
 
 /// Widest a block bubble gets, messaging-app style — prose stays a
 /// readable column instead of stretching across the whole panel.
@@ -31,9 +37,6 @@ const AVATAR_SIZE: f32 = 72.0;
 const AVATAR_RADIUS: f32 = 16.0;
 /// How far a preview line in the drag ghost may run before truncating.
 const GHOST_PREVIEW_CHARS: usize = 24;
-/// Read-mode prose collapses to this many lines (ellipsized), so long
-/// passages stay browseable — only the block being edited expands.
-const READ_MODE_MAX_LINES: usize = 6;
 /// How far (vertically) a press must travel before it stops being a
 /// click-to-edit and becomes a drag-to-reorder. Same idea as the canvas's
 /// click threshold; `mouse_area`'s built-in `on_drag` fires at >1px,
@@ -121,6 +124,14 @@ pub struct StoryNodeEditor {
     pending_drag: Option<(Uuid, Option<f32>)>,
     /// Some while a drag-to-reorder is in flight; see `DragState`.
     drag: Option<DragState>,
+    /// Preferences mirror: whether removing a block asks first — set by
+    /// `CanvasPage` at construction and on preference changes.
+    pub confirm_delete_blocks: bool,
+    /// Some while a block delete confirmation is pending for this block.
+    pending_delete: Option<(Uuid, ConfirmDialog)>,
+    /// Set when the delete dialog's "Don't ask again" was accepted —
+    /// polled by `CanvasPage::take_confirm_disables`.
+    confirm_disable: bool,
 }
 
 /// Widget-level messages from the editor's own `view()`.
@@ -137,8 +148,11 @@ pub enum EditorMessage {
     /// One of the add-block toolbar buttons was pressed; appends a fresh
     /// block.
     AddBlock(BlockKind),
-    /// A bubble's hover-only "✕" button was pressed.
+    /// A bubble's hover-only "✕" button was pressed; removes the block —
+    /// after a confirmation dialog when the Preferences toggle is on.
     RemoveBlock(Uuid),
+    /// Forwarded from the block delete-confirmation dialog's own `view()`.
+    ConfirmDelete(ConfirmDialogMessage),
     /// The cursor entered/left a block row (while not dragging); see
     /// `hovered_block`.
     BlockHoverEnter(Uuid),
@@ -232,7 +246,16 @@ impl StoryNodeEditor {
             open_dropdown: None,
             pending_drag: None,
             drag: None,
+            confirm_delete_blocks: false,
+            pending_delete: None,
+            confirm_disable: false,
         }
+    }
+
+    /// Takes whether the block delete dialog's "Don't ask again" was
+    /// accepted since last polled; see `CanvasPage::take_confirm_disables`.
+    pub fn take_confirm_disable(&mut self) -> bool {
+        std::mem::take(&mut self.confirm_disable)
     }
 
     /// Applies an `EditorMessage`, updating this editor's own live copy so
@@ -277,21 +300,46 @@ impl StoryNodeEditor {
             }
 
             EditorMessage::RemoveBlock(id) => {
-                self.blocks.retain(|block| block.id != id);
-                self.prose_contents.remove(&id);
-                if self.editing_block == Some(id) {
-                    self.editing_block = None;
+                if self.confirm_delete_blocks {
+                    self.pending_delete = Some((
+                        id,
+                        ConfirmDialog::new(
+                            fl!("confirm-delete-block-title"),
+                            fl!("confirm-delete-block-message"),
+                        )
+                        .with_dont_ask(),
+                    ));
+                    return EditorEvent::None;
                 }
-                if self.hovered_block == Some(id) {
-                    self.hovered_block = None;
+                self.remove_block(id)
+            }
+
+            EditorMessage::ConfirmDelete(ConfirmDialogMessage::Cancel) => {
+                self.pending_delete = None;
+                EditorEvent::None
+            }
+
+            EditorMessage::ConfirmDelete(ConfirmDialogMessage::DontAskToggled(checked)) => {
+                if let Some((_, dialog)) = &mut self.pending_delete {
+                    dialog.dont_ask = Some(checked);
                 }
-                if matches!(
-                    self.open_dropdown,
-                    Some(DropdownId::Speaker(block) | DropdownId::ChoiceTarget { block, .. }) if block == id
-                ) {
-                    self.open_dropdown = None;
+                EditorEvent::None
+            }
+
+            EditorMessage::ConfirmDelete(ConfirmDialogMessage::Confirm) => {
+                match self.pending_delete.take() {
+                    Some((id, dialog)) => {
+                        // "Don't ask again": stop confirming block deletes
+                        // (`CanvasPage` polls `take_confirm_disable` to
+                        // persist it).
+                        if dialog.dont_ask_again() {
+                            self.confirm_delete_blocks = false;
+                            self.confirm_disable = true;
+                        }
+                        self.remove_block(id)
+                    }
+                    None => EditorEvent::None,
                 }
-                self.blocks_changed()
             }
 
             EditorMessage::BlockHoverEnter(id) => {
@@ -509,6 +557,27 @@ impl StoryNodeEditor {
         EditorEvent::BlocksChanged(self.blocks.clone())
     }
 
+    /// Actually removes block `id` and clears any state pointing at it —
+    /// the shared second half of a confirmed dialog and of a
+    /// confirmation-free delete.
+    fn remove_block(&mut self, id: Uuid) -> EditorEvent {
+        self.blocks.retain(|block| block.id != id);
+        self.prose_contents.remove(&id);
+        if self.editing_block == Some(id) {
+            self.editing_block = None;
+        }
+        if self.hovered_block == Some(id) {
+            self.hovered_block = None;
+        }
+        if matches!(
+            self.open_dropdown,
+            Some(DropdownId::Speaker(block) | DropdownId::ChoiceTarget { block, .. }) if block == id
+        ) {
+            self.open_dropdown = None;
+        }
+        self.blocks_changed()
+    }
+
     /// Enters `id`'s prose edit mode. Switching from another in-flight
     /// edit commits it — Cancel is the only path that discards a draft.
     fn begin_edit(&mut self, id: Uuid) -> EditorEvent {
@@ -554,7 +623,14 @@ impl StoryNodeEditor {
     /// speaker dropdowns) and `nodes` (every node on the canvas, for choice
     /// target dropdowns) are only read to build owned widget data —
     /// dangling references simply don't resolve to a selection.
-    pub fn view<'a>(&'a self, characters: &[Character], nodes: &[StoryNode]) -> Element<'a, EditorMessage> {
+    /// `preview_lines` is the Preferences value for how many lines a
+    /// read-mode prose bubble shows before ellipsizing.
+    pub fn view<'a>(
+        &'a self,
+        characters: &[Character],
+        nodes: &[StoryNode],
+        preview_lines: usize,
+    ) -> Element<'a, EditorMessage> {
         // Header: "Editing <title>" + Edit/Close normally; while a title
         // edit is in flight the label becomes an input and Edit/Close give
         // way to Save/Cancel. (No Delete button — the canvas hover-delete
@@ -623,7 +699,7 @@ impl StoryNodeEditor {
             {
                 list = list.push(insertion_line());
             }
-            list = list.push(self.block_row(index, block, characters, nodes));
+            list = list.push(self.block_row(index, block, characters, nodes, preview_lines));
             if let (Some(from), Some(over)) = (drag_from, drag_over)
                 && over == index && over > from
             {
@@ -665,7 +741,7 @@ impl StoryNodeEditor {
             list.into()
         };
 
-        Column::new()
+        let content: Element<'a, EditorMessage> = Column::new()
             .push(header)
             .push(toolbar)
             .push(
@@ -681,7 +757,16 @@ impl StoryNodeEditor {
             .padding(16)
             .width(Length::Fill)
             .height(Length::Fill)
-            .into()
+            .into();
+
+        // The block delete-confirmation dialog dims and blocks the whole
+        // editor while pending, same as the pages' delete dialogs.
+        match &self.pending_delete {
+            Some((_, dialog)) => {
+                with_overlay(content, dialog.view().map(EditorMessage::ConfirmDelete), SHADE_ALPHA)
+            }
+            None => content,
+        }
     }
 
     /// One block as a messaging-thread row: character dialogue sits left
@@ -695,6 +780,7 @@ impl StoryNodeEditor {
         block: &'a StoryBlock,
         characters: &[Character],
         nodes: &[StoryNode],
+        preview_lines: usize,
     ) -> Element<'a, EditorMessage> {
         // The drag pill only materializes while its row is hovered (and no
         // drag is in flight — the row's own `on_release` handles drops);
@@ -763,13 +849,13 @@ impl StoryNodeEditor {
         let is_editing = self.editing_block == Some(block.id);
         let body: Element<'a, EditorMessage> = match &block.content {
             BlockContent::Narration { .. } => {
-                self.prose_body(block, is_editing, fl!("block-narration-placeholder"))
+                self.prose_body(block, is_editing, fl!("block-narration-placeholder"), preview_lines)
             }
             BlockContent::Dialogue { .. } => {
-                self.prose_body(block, is_editing, fl!("block-dialogue-placeholder"))
+                self.prose_body(block, is_editing, fl!("block-dialogue-placeholder"), preview_lines)
             }
             BlockContent::Note { .. } => {
-                self.prose_body(block, is_editing, fl!("block-note-placeholder"))
+                self.prose_body(block, is_editing, fl!("block-note-placeholder"), preview_lines)
             }
             BlockContent::Choice { options } => {
                 choice_body(self.node_id, block.id, options, nodes, self.open_dropdown)
@@ -891,6 +977,7 @@ impl StoryNodeEditor {
         block: &'a StoryBlock,
         is_editing: bool,
         placeholder: String,
+        preview_lines: usize,
     ) -> Element<'a, EditorMessage> {
         let block_id = block.id;
 
@@ -899,15 +986,16 @@ impl StoryNodeEditor {
             // `WordOrGlyph` + `Fill`: an unbroken run longer than the
             // bubble (e.g. "aaaa…") breaks mid-word instead of overflowing
             // the bubble sideways across the gutter. The line-count
-            // ellipsize keeps long passages collapsed while browsing —
-            // only the block being edited expands to full height.
+            // ellipsize (the Preferences "Collapsed preview lines" value)
+            // keeps long passages collapsed while browsing — only the
+            // block being edited expands to full height.
             return if text.is_empty() {
                 caption(placeholder).into()
             } else {
                 body(text)
                     .width(Length::Fill)
                     .wrapping(Wrapping::WordOrGlyph)
-                    .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(READ_MODE_MAX_LINES)))
+                    .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(preview_lines)))
                     .into()
             };
         }

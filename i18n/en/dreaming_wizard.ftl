@@ -16,6 +16,8 @@ item_load = Load Project
 
 # Header Start: Help
 item_about = About
+# Jumps to (and highlights) the Preferences page's Language setting
+item_language = Language
 about_comments = A narrative tool for creative storytelling.
 
 # Header Start: Action
@@ -87,15 +89,38 @@ toast-saved = Saved ✓
 nav-canvas-id = Canvas
 # Character tab
 nav-characters-id = Characters
-# Settings tab
-nav-settings-id = Settings
+# Preferences tab
+nav-settings-id = Preferences
 
 # <--------------------->
 
-## Settings page
+## Preferences page
 
-# Placeholder shown until the page actually has settings to configure
-settings-placeholder = Nothing to configure yet.
+# Section 1: the open project's own metadata (stored in project.json)
+prefs-section-project = Project
+prefs-author = Author name
+prefs-author-placeholder = Who's writing this story?
+prefs-comment = Comment
+prefs-comment-placeholder = A short description of the project...
+prefs-repository = Repository link
+prefs-repository-placeholder = https://github.com/you/your-story
+
+# Section 2: development workflow
+prefs-section-development = Development
+prefs-autosave = Autosave
+prefs-autosave-interval = Autosave interval (minutes)
+prefs-reopen = Reopen last project on launch
+
+# Section 3: editor behavior
+prefs-section-editor = Editor
+prefs-zoom-sensitivity = Zoom sensitivity
+prefs-preview-lines = Collapsed preview lines
+prefs-confirm-nodes = Confirm before deleting nodes
+prefs-confirm-characters = Confirm before deleting characters
+prefs-confirm-blocks = Confirm before deleting blocks
+prefs-language = Language
+# The language radio that follows the system locale instead of overriding
+prefs-language-system = System default
 
 ## Canvas page
 
@@ -181,10 +206,15 @@ tooltip-add-character = Add Character
 tooltip-delete = Delete
 confirm-dialog-cancel = Cancel
 confirm-dialog-delete = Delete
+# Checkbox offering to disable this kind of confirmation (see the
+# per-entity toggles on the Preferences page)
+confirm-dont-ask-again = Don't ask again
 confirm-delete-node-title = Delete Story Node?
 confirm-delete-node-message = Are you sure you want to delete "{$title}"? This can't be undone.
 confirm-delete-character-title = Delete Character?
 confirm-delete-character-message = Are you sure you want to delete "{$name}"? This can't be undone.
+confirm-delete-block-title = Delete Block?
+confirm-delete-block-message = Are you sure you want to delete this block? This can't be undone.
 
 ## Unsaved changes warning (shared UnsavedChangesDialog: editor close, app exit)
 
