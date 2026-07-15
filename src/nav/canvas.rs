@@ -99,6 +99,11 @@ pub struct CanvasPage {
     // view() unique fields
     pub editor: Option<StoryNodeEditor>, // Some while a node's editor is open; freezes the canvas (see canvas::Program::update).
     pub nodes: Vec<StoryNode>, // Every node currently on the canvas.
+    /// The story's entry point (start node), marked on the canvas with a
+    /// star badge + accent border. Auto-assigned to the first node created
+    /// when unset; persisted in the project manifest (`project.toml`), so
+    /// `AppModel` reads it at save time and seeds it on load.
+    pub root_node: Option<Uuid>,
 
     // camera animation fields
     camera_anim: Option<CameraAnimation>,
@@ -172,6 +177,8 @@ pub enum CanvasMessage {
     NodeHoverChanged(Option<Uuid>),
     /// The hover-delete button on a node was clicked; see `pending_delete`.
     NodeDeleteRequested(Uuid),
+    /// A node's hover "set as start" button was clicked; see `root_node`.
+    SetRootNode(Uuid),
     /// Forwarded from the open `ConfirmDialog`'s own `view()`.
     ConfirmDelete(ConfirmDialogMessage),
     /// Forwarded from the open `StoryNodeEditor`'s own `view()`.
@@ -199,6 +206,7 @@ impl Default for CanvasPage {
             offset: Vector::new(0.0, 0.0),
             editor: None,
             nodes: Vec::new(),
+            root_node: None,
             last_bounds: Cell::new(Size::new(800.0, 600.0)), // fallback before first draw
             camera_anim: None,
             saved_camera: None,
@@ -321,14 +329,34 @@ impl CanvasPage {
                 .x(screen.x)
                 .y(screen.y);
 
-                let stack = stack.push(node_widget);
+                let mut stack = stack.push(node_widget);
 
-                // A real `Button`, not a `mouse_area` — it only intercepts
-                // clicks within its own small bounds, so the rest of the
+                let is_root = self.root_node == Some(node.id);
+
+                // The start node's badge: a small star pinned over the
+                // node's top-left corner, always visible (it marks project
+                // state, unlike the hover-only action buttons below).
+                if is_root {
+                    let badge = widget::container(icon::from_name("starred-symbolic").icon().size(12))
+                        .padding(4)
+                        .style(|_theme: &cosmic::Theme| cosmic::iced::widget::container::Style {
+                            background: Some(Background::Color(Color::from_rgb8(45, 45, 48))),
+                            border: Border {
+                                width: 1.5,
+                                color: Color::from_rgb8(240, 190, 70),
+                                radius: Radius::new(12.0),
+                            },
+                            ..Default::default()
+                        });
+                    stack = stack.push(pin(badge).x(screen.x - 12.0).y(screen.y - 12.0));
+                }
+
+                // Real `Button`s, not `mouse_area`s — they only intercept
+                // clicks within their own small bounds, so the rest of the
                 // node's area (and the raw canvas beneath it) still work
                 // normally for dragging/click-to-edit. Never shown while an
                 // editor is open (on top of `NodeClicked` clearing
-                // `hovered_node`, this also covers it staying visible for
+                // `hovered_node`, this also covers them staying visible for
                 // whichever node's editor is currently open).
                 if self.editor.is_none() && self.hovered_node == Some(node.id) {
                     let delete_button = button::icon(icon::from_name("edit-delete-symbolic"))
@@ -337,10 +365,22 @@ impl CanvasPage {
                         .tooltip(fl!("tooltip-delete"))
                         .on_press(CanvasMessage::NodeDeleteRequested(node.id));
 
-                    stack.push(pin(delete_button).x(screen.x + screen_width - 14.0).y(screen.y - 14.0))
-                } else {
-                    stack
+                    stack = stack.push(pin(delete_button).x(screen.x + screen_width - 14.0).y(screen.y - 14.0));
+
+                    // "Set as start" over the top-left corner — where the
+                    // badge will land — but only for nodes that aren't the
+                    // start already.
+                    if !is_root {
+                        let root_button = button::icon(icon::from_name("non-starred-symbolic"))
+                            .extra_small()
+                            .tooltip(fl!("tooltip-set-start-node"))
+                            .on_press(CanvasMessage::SetRootNode(node.id));
+
+                        stack = stack.push(pin(root_button).x(screen.x - 14.0).y(screen.y - 14.0));
+                    }
                 }
+
+                stack
             }
         ).clip(true);
 
@@ -417,6 +457,11 @@ impl CanvasPage {
                 };
 
                 let node = StoryNode { position: top_left, ..default_node };
+                // A story always has an entry point: the first node created
+                // becomes the start node until the user picks another.
+                if self.root_node.is_none() {
+                    self.root_node = Some(node.id);
+                }
                 self.nodes.push(node);
                 self.geo_cache.clear();
                 self.content_dirty = true;
@@ -476,6 +521,14 @@ impl CanvasPage {
 
             CanvasMessage::NodeDeleteRequested(id) => {
                 self.request_delete(id);
+                None
+            }
+
+            CanvasMessage::SetRootNode(id) => {
+                self.root_node = Some(id);
+                // The start marker (badge + accent border) moved nodes.
+                self.geo_cache.clear();
+                self.content_dirty = true;
                 None
             }
 
@@ -704,6 +757,12 @@ impl CanvasPage {
     /// dialog and of a confirmation-free delete.
     fn delete_node(&mut self, id: Uuid) {
         self.nodes.retain(|n| n.id != id);
+        // Deleting the start node hands the marker to the first remaining
+        // node (if any), keeping "a story with nodes has an entry point"
+        // true without asking.
+        if self.root_node == Some(id) {
+            self.root_node = self.nodes.first().map(|n| n.id);
+        }
         self.geo_cache.clear();
         self.hovered_node = None;
         self.content_dirty = true;
@@ -1144,6 +1203,23 @@ impl canvas::Program<CanvasMessage, Theme, Renderer> for CanvasPage {
                 }
 
                 node.draw(frame); // no text, just the rounded rectangle
+
+                // The start node reads differently at a glance: a warm
+                // accent border on top of the standard node stroke,
+                // matching its corner badge in `view()`.
+                if self.root_node == Some(node.id) {
+                    let path = canvas::Path::rounded_rectangle(
+                        node.position.clone().into(),
+                        node.size.clone().into(),
+                        8.0.into(),
+                    );
+                    frame.stroke(
+                        &path,
+                        canvas::Stroke::default()
+                            .with_color(Color::from_rgb8(240, 190, 70))
+                            .with_width(2.0),
+                    );
+                }
             }
         })]
 

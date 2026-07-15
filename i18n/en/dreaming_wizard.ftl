@@ -41,7 +41,7 @@ project-author-fallback = Unknown
 
 # Load dialog: window title (picks an existing project folder)
 dialog-load-title = Choose Project Folder
-# Save dialog: window title (the "Browse" button inside SaveProjectDialog;
+# Browse dialog: window title (the "Browse" button inside NewProjectDialog;
 # picks the *parent* folder a new project's own directory is created under)
 dialog-save-title = Choose Location
 # Avatar picker dialog: file filter label, restricting choices to images
@@ -54,30 +54,38 @@ dialog-image-filter-label = Images
 popup-close-tooltip = Close
 # Load Project popup: title, shared by both failure reasons below
 popup-load-error-title = Couldn't Load Project
-# Load Project popup: shown when the chosen folder has no project.json
-popup-missing-project-message = This folder doesn't contain a project.json file.
-# Load Project popup: shown when project.json exists but isn't valid JSON
-popup-invalid-project-message = This folder's project.json file is invalid or corrupted.
+# Load Project popup: shown when the chosen folder has neither a
+# project.toml manifest nor a legacy project.json
+popup-missing-project-message = This folder doesn't contain a project.toml (or legacy project.json) file.
+# Load Project popup: shown when the project files exist but couldn't be parsed
+popup-invalid-project-message = This folder's project files are invalid or corrupted.
 # Save Project popup: title
 popup-save-error-title = Couldn't Save Project
 # Save Project popup: shown when the new project's directory couldn't be created
 popup-save-dir-failed-message = Couldn't create the project folder. Check the location and try again.
 # <--------------------->
 
-## Save Project dialog (first save of a brand-new project)
+## New Project dialog (startup with no project to reopen, and File → New)
 
-save-dialog-title = Save New Project
-save-dialog-name-label = Name
-save-dialog-name-placeholder = My Project
-save-dialog-path-label = Save as
-save-dialog-path-placeholder = Choose a location...
-save-dialog-browse = Browse
-save-dialog-cancel = Cancel
-save-dialog-confirm = Save Project
-# Shown when Save Project is pressed before a location has been chosen
-save-dialog-error-incomplete = Choose a location before saving.
-# Shown when the resulting Name+location already exists and isn't empty
-save-dialog-error-not-empty = Path is not empty.
+new-project-title = New Project
+new-project-name-label = Name
+new-project-name-placeholder = My Project
+new-project-path-label = Location
+new-project-path-placeholder = Choose a location...
+new-project-author-label = Author
+new-project-author-placeholder = Who's writing this story?
+new-project-comment-label = Comment
+new-project-comment-placeholder = A short description of the project...
+new-project-browse = Browse
+new-project-cancel = Cancel
+new-project-create = Create Project
+# Runs the same folder picker as File → Load; a successful load replaces
+# this dialog entirely
+new-project-open-existing = Open existing…
+# Shown when Create Project is pressed before a name+location are set
+new-project-error-incomplete = Choose a name and location first.
+# Shown when the resulting name+location already exists and isn't empty
+new-project-error-not-empty = That folder already exists and isn't empty.
 # <--------------------->
 
 # Toast shown after silently re-saving an already-open project
@@ -146,6 +154,9 @@ editor-title-placeholder = Write node's title here...
 
 # Floating "+" button tooltip on the canvas page
 tooltip-add-node = Add Node
+
+# Hover button on a node: makes it the story's entry point (start node)
+tooltip-set-start-node = Set as start node
 
 ## Story node editor: content blocks
 
