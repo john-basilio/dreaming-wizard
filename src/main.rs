@@ -13,7 +13,27 @@ mod components;
 
 fn main() -> cosmic::iced::Result {
     // Get the system's preferred languages.
-    let requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
+    let mut requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
+
+    // The Preferences page's language override wins over the system
+    // locale when set — read it straight from cosmic_config, since the
+    // app model (and its own config load) doesn't exist yet.
+    {
+        use cosmic::cosmic_config::CosmicConfigEntry;
+
+        if let Ok(handle) = cosmic::cosmic_config::Config::new(
+            <app::AppModel as cosmic::Application>::APP_ID,
+            config::Config::VERSION,
+        ) {
+            let config = match config::Config::get_entry(&handle) {
+                Ok(config) => config,
+                Err((_errors, config)) => config,
+            };
+            if let Some(language) = config.language.as_deref().and_then(|s| s.parse().ok()) {
+                requested_languages = vec![language];
+            }
+        }
+    }
 
     // Enable localizations to be applied.
     i18n::init(&requested_languages);

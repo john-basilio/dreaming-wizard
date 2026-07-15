@@ -98,6 +98,14 @@ pub struct CharactersPage {
     /// update its own project-wide "is anything unsaved" flag. Doesn't
     /// reset itself; the caller must consume it.
     content_dirty: bool,
+
+    /// Preferences mirror: whether deleting a character asks first — kept
+    /// in sync by `AppModel`.
+    pub confirm_delete: bool,
+    /// Set when the delete dialog's "Don't ask again" was accepted —
+    /// polled by `AppModel` (via `take_confirm_disable`) to write the
+    /// preference back to `Config`.
+    confirm_disable: bool,
 }
 
 impl Default for CharactersPage {
@@ -118,6 +126,8 @@ impl Default for CharactersPage {
             pending_scroll: None,
             glow: None,
             content_dirty: false,
+            confirm_delete: true,
+            confirm_disable: false,
         }
     }
 }
@@ -138,7 +148,15 @@ impl CharactersPage {
             pending_scroll: None,
             glow: None,
             content_dirty: false,
+            confirm_delete: true,
+            confirm_disable: false,
         }
+    }
+
+    /// Takes whether the delete dialog's "Don't ask again" was accepted
+    /// since last polled; `AppModel` persists the `Config` flag.
+    pub fn take_confirm_disable(&mut self) -> bool {
+        std::mem::take(&mut self.confirm_disable)
     }
 
     /// Whether the add-button tooltip is mid-fade; used by the app's
@@ -384,15 +402,23 @@ impl CharactersPage {
                 None
             }
 
-            CharactersMessage::ConfirmDelete(ConfirmDialogMessage::Confirm) => {
-                if let Some((id, _)) = self.pending_delete.take() {
-                    self.characters.retain(|c| c.id != id);
-                    self.hovered = None;
-                    self.content_dirty = true;
+            CharactersMessage::ConfirmDelete(ConfirmDialogMessage::DontAskToggled(checked)) => {
+                if let Some((_, dialog)) = &mut self.pending_delete {
+                    dialog.dont_ask = Some(checked);
+                }
+                None
+            }
 
-                    if self.editor.as_ref().is_some_and(|e| e.character_id == id) {
-                        self.close_editor();
+            CharactersMessage::ConfirmDelete(ConfirmDialogMessage::Confirm) => {
+                if let Some((id, dialog)) = self.pending_delete.take() {
+                    // "Don't ask again" was checked: stop confirming
+                    // character deletes from now on (AppModel polls
+                    // `take_confirm_disable` to persist it).
+                    if dialog.dont_ask_again() {
+                        self.confirm_delete = false;
+                        self.confirm_disable = true;
                     }
+                    self.delete_character(id);
                 }
                 None
             }
@@ -503,15 +529,35 @@ impl CharactersPage {
     }
 
     /// Builds the delete-confirmation dialog for character `id` (using its
-    /// current name) and stores it as `pending_delete`; shared by a card's
-    /// hover-delete button and the open editor's own Delete button.
+    /// current name) and stores it as `pending_delete` — or, when
+    /// character confirmations are off (Preferences), deletes immediately.
+    /// Shared by a card's hover-delete button and the open editor's own
+    /// Delete button.
     fn request_delete(&mut self, id: Uuid) {
+        if !self.confirm_delete {
+            self.delete_character(id);
+            return;
+        }
+
         let name = self.characters.iter().find(|c| c.id == id).map(|c| c.name.as_str()).unwrap_or_default();
         let dialog = ConfirmDialog::new(
             fl!("confirm-delete-character-title"),
             fl!("confirm-delete-character-message", name = name),
-        );
+        )
+        .with_dont_ask();
 
         self.pending_delete = Some((id, dialog));
+    }
+
+    /// Actually removes character `id` — the shared second half of a
+    /// confirmed dialog and of a confirmation-free delete.
+    fn delete_character(&mut self, id: Uuid) {
+        self.characters.retain(|c| c.id != id);
+        self.hovered = None;
+        self.content_dirty = true;
+
+        if self.editor.as_ref().is_some_and(|e| e.character_id == id) {
+            self.close_editor();
+        }
     }
 }

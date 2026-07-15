@@ -47,6 +47,11 @@ pub struct ProjectData {
     pub name: String,
     pub author: String,
     pub comment: String,
+    /// Project repository URL (e.g. a GitHub link); purely informational.
+    /// `#[serde(default)]` so project files saved before this field
+    /// existed still load.
+    #[serde(default)]
+    pub repository: String,
     pub app_version: String, // App version that last saved the file
     pub created_at: String, // ISO 8601 timestamp
     pub updated_at: String, // Updates every save.

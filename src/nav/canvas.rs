@@ -131,6 +131,17 @@ pub struct CanvasPage {
     /// update its own project-wide "is anything unsaved" flag. Doesn't
     /// reset itself; the caller must consume it.
     content_dirty: bool,
+
+    /// Preferences mirrors, kept in sync by `AppModel` via `sync_prefs`
+    /// (the page can't read `Config` itself).
+    pub zoom_sensitivity: f32,
+    pub preview_lines: usize,
+    pub confirm_delete_nodes: bool,
+    pub confirm_delete_blocks: bool,
+    /// Set when a delete dialog's "Don't ask again" was accepted for
+    /// nodes — polled by `AppModel` (via `take_confirm_disables`) to
+    /// write the preference back to `Config`.
+    confirm_disable_nodes: bool,
 }
 
 /// Messages emitted by the canvas page.
@@ -196,6 +207,11 @@ impl Default for CanvasPage {
             add_button_tooltip: HoverTooltip::default(),
             glow: None,
             content_dirty: false,
+            zoom_sensitivity: 0.1,
+            preview_lines: 6,
+            confirm_delete_nodes: true,
+            confirm_delete_blocks: false,
+            confirm_disable_nodes: false,
         }
     }
 }
@@ -206,12 +222,12 @@ impl Default for CanvasPage {
 /// shared by both `view` and the `canvas::Program` impl below.
 impl CanvasPage {
     /// Furthest the user can zoom out.
-    const MIN_ZOOM: f32 = 0.1;
+    const MIN_ZOOM: f32 = 0.2;
     /// Furthest the user can zoom in.
-    const MAX_ZOOM: f32 = 4.0;
-    /// Multiplier applied to scroll input before it changes `zoom`; higher
-    /// = faster zooming per wheel notch/trackpad pixel.
-    const ZOOM_SENSITIVITY: f32 = 0.1;
+    const MAX_ZOOM: f32 = 3.0;
+    /// How long one wheel notch's zoom transition takes — short enough to
+    /// feel immediate, long enough to read as smooth rather than snapping.
+    const ZOOM_ANIM_DURATION: Duration = Duration::from_millis(120);
 
     /// How much wider than the edited node the reserved canvas gap is, both
     /// for the editor's `Row` sizing in `view()` and for centering the node
@@ -351,7 +367,7 @@ impl CanvasPage {
                     widget::container(stack)
                         .width(Length::Fixed(node_width * Self::EDITOR_GAP_MULTIPLIER))
                         .height(Length::Fill),
-                    editor.view(characters, &self.nodes).map(CanvasMessage::Editor),
+                    editor.view(characters, &self.nodes, self.preview_lines).map(CanvasMessage::Editor),
                 ].into()
             },
 
@@ -422,7 +438,8 @@ impl CanvasPage {
             },
             CanvasMessage::NodeClicked { id } => {
                 if let Some(node) = self.nodes.iter().find(|n| n.id == id) {
-                    let editor = StoryNodeEditor::new(node);
+                    let mut editor = StoryNodeEditor::new(node);
+                    editor.confirm_delete_blocks = self.confirm_delete_blocks;
                     let size = node.size.clone();
                     let position = node.position.clone();
 
@@ -467,38 +484,49 @@ impl CanvasPage {
                 None
             }
 
-            CanvasMessage::ConfirmDelete(ConfirmDialogMessage::Confirm) => {
-                if let Some((id, _)) = self.pending_delete.take() {
-                    self.nodes.retain(|n| n.id != id);
-                    self.geo_cache.clear();
-                    self.hovered_node = None;
-                    self.content_dirty = true;
+            CanvasMessage::ConfirmDelete(ConfirmDialogMessage::DontAskToggled(checked)) => {
+                if let Some((_, dialog)) = &mut self.pending_delete {
+                    dialog.dont_ask = Some(checked);
+                }
+                None
+            }
 
-                    // Deleted the node currently being edited — close the
-                    // editor and restore the camera, same as a normal Close.
-                    if self.editor.as_ref().is_some_and(|e| e.node_id == id) {
-                        self.close_editor();
+            CanvasMessage::ConfirmDelete(ConfirmDialogMessage::Confirm) => {
+                if let Some((id, dialog)) = self.pending_delete.take() {
+                    // "Don't ask again" was checked: stop confirming node
+                    // deletes from now on (AppModel polls
+                    // `take_confirm_disables` to persist it).
+                    if dialog.dont_ask_again() {
+                        self.confirm_delete_nodes = false;
+                        self.confirm_disable_nodes = true;
                     }
+                    self.delete_node(id);
                 }
                 None
             }
 
             CanvasMessage::Zoomed { at, scroll_amount } => {
-                let old_zoom = self.zoom;
-                let new_zoom = (old_zoom * (1.0 + scroll_amount * Self::ZOOM_SENSITIVITY))
+                // Zoom is animated rather than instant. Chain from the
+                // in-flight animation's *target* (not the interpolated
+                // current state) so rapid wheel ticks accumulate instead
+                // of each restarting from nearly the same zoom.
+                let (base_offset, base_zoom) = self.camera_anim.as_ref()
+                    .map_or((self.offset, self.zoom), |anim| (anim.target_offset, anim.target_zoom));
+
+                let new_zoom = (base_zoom * (1.0 + scroll_amount * self.zoom_sensitivity))
                     // Clamp the zoom level to prevent it from going too far in or out.
                     .clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
 
-                let world_x = (at.x - self.offset.x) / old_zoom;
-                let world_y = (at.y - self.offset.y) / old_zoom;
-
-                self.offset = Vector::new(
+                // Keep the world point under the cursor fixed at the
+                // target state; the short transition interpolates to it.
+                let world_x = (at.x - base_offset.x) / base_zoom;
+                let world_y = (at.y - base_offset.y) / base_zoom;
+                let target_offset = Vector::new(
                     at.x - world_x * new_zoom,
                     at.y - world_y * new_zoom,
                 );
 
-                self.zoom = new_zoom;
-                self.geo_cache.clear();
+                self.start_camera_animation_timed(target_offset, new_zoom, Self::ZOOM_ANIM_DURATION);
 
                 None
             }
@@ -621,9 +649,13 @@ impl CanvasPage {
     }
 
     fn start_camera_animation(&mut self, target_offset: Vector, target_zoom: f32) {
+        self.start_camera_animation_timed(target_offset, target_zoom, Self::CAMERA_ANIM_DURATION);
+    }
+
+    fn start_camera_animation_timed(&mut self, target_offset: Vector, target_zoom: f32, duration: Duration) {
         self.camera_anim = Some(CameraAnimation {
             start: Instant::now(),
-            duration: Self::CAMERA_ANIM_DURATION,
+            duration,
             start_offset: self.offset,
             start_zoom: self.zoom,
             target_offset,
@@ -650,16 +682,67 @@ impl CanvasPage {
     }
 
     /// Builds the delete-confirmation dialog for node `id` (using its
-    /// current title) and stores it as `pending_delete`; shared by the
-    /// hover-delete button and the open editor's own Delete button.
+    /// current title) and stores it as `pending_delete` — or, when node
+    /// confirmations are off (Preferences), deletes immediately.
     fn request_delete(&mut self, id: Uuid) {
+        if !self.confirm_delete_nodes {
+            self.delete_node(id);
+            return;
+        }
+
         let title = self.nodes.iter().find(|n| n.id == id).map(|n| n.title.clone()).unwrap_or_default();
         let dialog = ConfirmDialog::new(
             fl!("confirm-delete-node-title"),
             fl!("confirm-delete-node-message", title = title.as_str()),
-        );
+        )
+        .with_dont_ask();
 
         self.pending_delete = Some((id, dialog));
+    }
+
+    /// Actually removes node `id` — the shared second half of a confirmed
+    /// dialog and of a confirmation-free delete.
+    fn delete_node(&mut self, id: Uuid) {
+        self.nodes.retain(|n| n.id != id);
+        self.geo_cache.clear();
+        self.hovered_node = None;
+        self.content_dirty = true;
+
+        // Deleted the node currently being edited — close the editor and
+        // restore the camera, same as a normal Close.
+        if self.editor.as_ref().is_some_and(|e| e.node_id == id) {
+            self.close_editor();
+        }
+    }
+
+    /// Pushes the Preferences values this page mirrors (`AppModel` calls
+    /// this at startup and whenever one of them changes).
+    pub fn sync_prefs(
+        &mut self,
+        zoom_sensitivity: f32,
+        preview_lines: usize,
+        confirm_nodes: bool,
+        confirm_blocks: bool,
+    ) {
+        self.zoom_sensitivity = zoom_sensitivity;
+        self.preview_lines = preview_lines;
+        self.confirm_delete_nodes = confirm_nodes;
+        self.confirm_delete_blocks = confirm_blocks;
+        if let Some(editor) = &mut self.editor {
+            editor.confirm_delete_blocks = confirm_blocks;
+        }
+    }
+
+    /// Takes whether a delete dialog's "Don't ask again" was accepted
+    /// since last polled, for `(nodes, blocks)` — `AppModel` persists the
+    /// corresponding `Config` flags.
+    pub fn take_confirm_disables(&mut self) -> (bool, bool) {
+        let nodes = std::mem::take(&mut self.confirm_disable_nodes);
+        let blocks = self.editor.as_mut().is_some_and(|editor| editor.take_confirm_disable());
+        if blocks {
+            self.confirm_delete_blocks = false;
+        }
+        (nodes, blocks)
     }
 
     // Outputs the current screen's coordinates to where it is

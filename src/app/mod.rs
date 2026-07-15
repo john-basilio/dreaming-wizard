@@ -173,6 +173,9 @@ pub enum Message {
     // fade alpha; the actual "hide it" decision happens in the handler,
     // once enough time has elapsed.
     ToastTick,
+    // Fired by `subscription` while autosave is on and the project is
+    // dirty with a known path; re-checks and saves in the handler.
+    AutosaveTick,
     // Forwarded from the app-exit `unsaved_changes_dialog` shown by
     // `on_app_exit`; see `pending_exit_confirm`.
     UnsavedExit(UnsavedChangesMessage),
@@ -231,6 +234,115 @@ impl AppModel {
             Some(id) => cosmic::iced::window::close(id),
             None => Task::none(),
         }
+    }
+
+    /// Pushes the Preferences values the pages mirror (they can't read
+    /// `Config` themselves) — called at startup and whenever one changes.
+    fn sync_pref_pages(&mut self) {
+        self.canvas.sync_prefs(
+            self.config.zoom_sensitivity(),
+            self.config.preview_lines as usize,
+            self.config.confirm_delete_nodes,
+            self.config.confirm_delete_blocks,
+        );
+        self.characters.confirm_delete = self.config.confirm_delete_characters;
+    }
+
+    /// Re-selects the UI language from `config.language` (or back to the
+    /// system locale for `None`) and refreshes the strings that were
+    /// captured at init time rather than rendered fresh each frame — the
+    /// nav bar labels. Menu/page text picks the new language up on its
+    /// own, since `fl!` consults the loader on every `view`.
+    fn apply_language(&mut self) {
+        let requested = match self.config.language.as_deref().and_then(|s| s.parse().ok()) {
+            Some(language) => vec![language],
+            None => i18n_embed::DesktopLanguageRequester::requested_languages(),
+        };
+        crate::i18n::init(&requested);
+
+        let entities: Vec<_> = self.nav.iter().collect();
+        for id in entities {
+            let text = match self.nav.data::<Page>(id) {
+                Some(Page::Canvas) => fl!("nav-canvas-id"),
+                Some(Page::Characters) => fl!("nav-characters-id"),
+                Some(Page::Settings) => fl!("nav-settings-id"),
+                None => continue,
+            };
+            self.nav.text_set(id, text);
+        }
+    }
+
+    /// Handles every `Message::Settings` variant — the Preferences page
+    /// renders straight from `Config`/`ProjectData`, so applying its
+    /// messages is this model's job (it owns both).
+    fn handle_settings(&mut self, message: SettingsMessage) -> Task<cosmic::Action<Message>> {
+        match message {
+            // Section 1 edits the open project's metadata — unsaved
+            // changes like any other project edit.
+            SettingsMessage::AuthorChanged(value) => {
+                self.project_meta.author = value;
+                self.dirty = true;
+            }
+            SettingsMessage::CommentChanged(value) => {
+                self.project_meta.comment = value;
+                self.dirty = true;
+            }
+            SettingsMessage::RepositoryChanged(value) => {
+                self.project_meta.repository = value;
+                self.dirty = true;
+            }
+
+            SettingsMessage::AutosaveToggled(value) => {
+                self.config.autosave = value;
+                self.save_config();
+            }
+            SettingsMessage::AutosaveIntervalChanged(value) => {
+                self.config.autosave_interval_minutes = value;
+                self.save_config();
+            }
+            SettingsMessage::ReopenToggled(value) => {
+                self.config.reopen_last_project = value;
+                self.save_config();
+            }
+
+            SettingsMessage::ZoomSensitivityChanged(value) => {
+                self.config.zoom_sensitivity_percent = value;
+                self.save_config();
+                self.sync_pref_pages();
+            }
+            SettingsMessage::PreviewLinesChanged(value) => {
+                self.config.preview_lines = value;
+                self.save_config();
+                self.sync_pref_pages();
+            }
+            SettingsMessage::ConfirmNodesToggled(value) => {
+                self.config.confirm_delete_nodes = value;
+                self.save_config();
+                self.sync_pref_pages();
+            }
+            SettingsMessage::ConfirmCharactersToggled(value) => {
+                self.config.confirm_delete_characters = value;
+                self.save_config();
+                self.sync_pref_pages();
+            }
+            SettingsMessage::ConfirmBlocksToggled(value) => {
+                self.config.confirm_delete_blocks = value;
+                self.save_config();
+                self.sync_pref_pages();
+            }
+
+            SettingsMessage::LanguagePicked(language) => {
+                self.config.language = language;
+                self.save_config();
+                self.apply_language();
+                return self.update_title();
+            }
+
+            SettingsMessage::AnimationTick => {
+                self.settings.update(&SettingsMessage::AnimationTick);
+            }
+        }
+        Task::none()
     }
 }
 
@@ -323,7 +435,12 @@ impl cosmic::Application for AppModel {
             dirty: false,
         };
 
-        app.auto_load_last_project();
+        // Push the loaded Preferences into the pages that mirror them.
+        app.sync_pref_pages();
+
+        if app.config.reopen_last_project {
+            app.auto_load_last_project();
+        }
 
         // Create a startup command that sets the window title.
         let command = app.update_title();
@@ -403,7 +520,7 @@ impl cosmic::Application for AppModel {
                 self.characters.view().map(Message::Characters)
             },
             Page::Settings => {
-                self.settings.view().map(Message::Settings)
+                self.settings.view(&self.config, &self.project_meta).map(Message::Settings)
             },
         };
 
@@ -472,6 +589,13 @@ impl cosmic::Application for AppModel {
                     self.drawer_page = DrawerPage::About;
                     self.core.window.show_context = true;
                 }
+                // Points the user at where the language actually lives:
+                // jump to Preferences and pulse its Language row.
+                HelpMenuAction::Language => {
+                    self.activate_page(Page::Settings);
+                    self.settings.flash_language();
+                    return self.update_title();
+                }
             }}
 
             // Other messages
@@ -490,6 +614,18 @@ impl cosmic::Application for AppModel {
                 // per-message.
                 if self.canvas.take_content_dirty() {
                     self.dirty = true;
+                }
+                // A delete dialog's "Don't ask again" may have just been
+                // accepted; persist the preference it flipped.
+                let (nodes_off, blocks_off) = self.canvas.take_confirm_disables();
+                if nodes_off {
+                    self.config.confirm_delete_nodes = false;
+                }
+                if blocks_off {
+                    self.config.confirm_delete_blocks = false;
+                }
+                if nodes_off || blocks_off {
+                    self.save_config();
                 }
             }
 
@@ -547,9 +683,24 @@ impl cosmic::Application for AppModel {
                 if self.characters.take_content_dirty() {
                     self.dirty = true;
                 }
+                // See the matching "Don't ask again" note in
+                // `Message::Canvas` above.
+                if self.characters.take_confirm_disable() {
+                    self.config.confirm_delete_characters = false;
+                    self.save_config();
+                }
             }
 
-            Message::Settings(msg) => self.settings.update(msg),
+            Message::Settings(msg) => return self.handle_settings(msg),
+
+            Message::AutosaveTick => {
+                // Re-check at fire time — the subscription's conditions may
+                // have just changed. Never opens the save dialog: autosave
+                // only re-saves projects that already live somewhere.
+                if self.config.autosave && self.dirty && self.config.last_project_path.is_some() {
+                    return self.save_project();
+                }
+            }
 
             Message::CloseDrawer => {
                 self.drawer_page = DrawerPage::None;
@@ -700,6 +851,26 @@ impl cosmic::Application for AppModel {
             subscriptions.push(
                 cosmic::iced::time::every(std::time::Duration::from_millis(16))
                     .map(|_| Message::ToastTick),
+            );
+        }
+
+        // Only tick while the Preferences page's Language-row glow (from
+        // Help → Language) is fading, same reasoning as above.
+        if self.settings.is_glow_active() {
+            subscriptions.push(
+                cosmic::iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| Message::Settings(SettingsMessage::AnimationTick)),
+            );
+        }
+
+        // Autosave: only armed while it could actually do something — on,
+        // unsaved changes exist, and the project already has a home on
+        // disk (autosave never opens the name/location dialog).
+        if self.config.autosave && self.dirty && self.config.last_project_path.is_some() {
+            let minutes = u64::from(self.config.autosave_interval_minutes.max(1));
+            subscriptions.push(
+                cosmic::iced::time::every(std::time::Duration::from_secs(minutes * 60))
+                    .map(|_| Message::AutosaveTick),
             );
         }
 
