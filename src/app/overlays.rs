@@ -49,8 +49,8 @@ impl AppModel {
             None => content,
         };
 
-        let content = match &self.save_dialog {
-            Some(dialog) => with_overlay(content, dialog.view().map(Message::SaveDialog), SHADE_ALPHA),
+        let content = match &self.new_project_dialog {
+            Some(dialog) => with_overlay(content, dialog.view().map(Message::NewProject), SHADE_ALPHA),
             None => content,
         };
 

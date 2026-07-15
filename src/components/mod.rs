@@ -1,7 +1,7 @@
 //! Reusable, page-agnostic building blocks: the `StoryNode` data model and
 //! its on-canvas editor, the `Character` data model with its `character_card`
 //! view helper and `CharacterCardEditor`, the generic `SimplePopup` modal,
-//! the `SaveProjectDialog` used for a brand-new project's first save, the
+//! the `NewProjectDialog` used to create (or open) a project, the
 //! `ConfirmDialog` used for delete confirmations, the `overlay`
 //! dimming-shade/toast/corner-button helpers, the `save_button_class`
 //! Save-button style, small shared helpers, and the project file shape used
@@ -22,6 +22,9 @@ pub use dev_helper_fn::{display_title};
 pub mod project_data;
 pub use project_data::{ProjectFile, ProjectData, Character};
 
+pub mod new_project_dialog;
+pub use new_project_dialog::NewProjectDialog;
+
 pub mod character_card;
 pub use character_card::character_card;
 
@@ -30,9 +33,6 @@ pub use character_card_editor::CharacterCardEditor;
 
 pub mod simple_popup;
 pub use simple_popup::SimplePopup;
-
-pub mod save_project_dialog;
-pub use save_project_dialog::SaveProjectDialog;
 
 pub mod overlay;
 

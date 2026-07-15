@@ -35,10 +35,10 @@ use std::collections::HashMap;
 use crate::nav::{CanvasPage, CanvasMessage, CharactersPage, CharactersMessage, SettingsPage, SettingsMessage};
 
 use crate::components::{
-    ProjectData, SimplePopup, SaveProjectDialog, FindPanel, FindTarget,
+    ProjectData, SimplePopup, NewProjectDialog, FindPanel, FindTarget,
     character_card_editor::EditorMessage,
     simple_popup::PopupMessage,
-    save_project_dialog::SaveDialogMessage,
+    new_project_dialog::NewProjectMessage,
     unsaved_changes_dialog::UnsavedChangesMessage,
     find_panel::{FindMessage, query_input_id},
 };
@@ -91,10 +91,11 @@ pub struct AppModel {
     /// failure); see `overlays::apply_overlays` and `Message::Popup`.
     popup: Option<SimplePopup>,
 
-    /// Some while the "save a brand-new project" dialog is shown (opened
-    /// from `FileMenuAction::Save` when no project is open yet); see
-    /// `overlays::apply_overlays` and `Message::SaveDialog`.
-    save_dialog: Option<SaveProjectDialog>,
+    /// Some while the New Project dialog is shown — at startup whenever no
+    /// project could be reopened (blocking, no Cancel), or from
+    /// File → New/Ctrl+N (cancellable); see `overlays::apply_overlays` and
+    /// `Message::NewProject`.
+    new_project_dialog: Option<NewProjectDialog>,
 
     /// `Some(shown_at)` while the "Saved" toast is visible or fading out;
     /// `overlays` derives the current fade alpha straight from how long ago
@@ -157,17 +158,16 @@ pub enum Message {
     LaunchUrl(String),
     // Raw key presses, matched against `AppModel::key_binds`.
     Key(Modifiers, Key, Physical),
-    // The Load Project directory picker (opened from `FileMenuAction::Load`)
-    // resolved; `None` if it was cancelled or failed to open. `Some(dir)` is
-    // the chosen project *directory*, not a file — see
-    // `project_io::handle_load_dir_picked` for the `project.json`-on-
-    // top-level check.
+    // The Load Project directory picker (opened from `FileMenuAction::Load`
+    // or the New Project dialog's "Open existing…") resolved; `None` if it
+    // was cancelled or failed to open. `Some(dir)` is the chosen project
+    // *directory* — see `project_io::handle_load_dir_picked` for the
+    // manifest-on-top-level check.
     LoadDirPicked(Option<std::path::PathBuf>),
     // Forwarded from the open `SimplePopup`'s own `view()`.
     Popup(PopupMessage),
-    // Forwarded from the open `SaveProjectDialog`'s own `view()` (opened
-    // from `FileMenuAction::Save` when there's no project open yet).
-    SaveDialog(SaveDialogMessage),
+    // Forwarded from the open `NewProjectDialog`'s own `view()`.
+    NewProject(NewProjectMessage),
     // Fired periodically by `subscription` while `AppModel::saved_toast` is
     // set, purely to force a redraw so `overlays` can recompute the toast's
     // fade alpha; the actual "hide it" decision happens in the handler,
@@ -223,6 +223,59 @@ impl AppModel {
         if let Some(context) = &self.config_handle
             && let Err(err) = self.config.write_entry(context) {
             eprintln!("failed to write config: {err}");
+        }
+    }
+
+    /// Imports a just-picked avatar image into the open project's
+    /// `assets/images/`, returning the (absolute) path of the copy inside
+    /// the project — that's what gets stored and rendered from here on
+    /// (relative-ized only at save time; see `Character::avatar`). Name
+    /// collisions with a *different* image get a `-2`/`-3`… suffix;
+    /// re-picking an identical file reuses the existing copy. If anything
+    /// prevents the import (no open project, unreadable source, copy
+    /// failure), the picked path is returned unchanged — an external
+    /// absolute path still renders, it's just not portable.
+    fn import_avatar(&self, picked: std::path::PathBuf) -> std::path::PathBuf {
+        let Some(project_dir) = self.project_dir() else {
+            return picked;
+        };
+        // Already inside the project (e.g. re-picked from assets/) — no
+        // copy needed.
+        if picked.starts_with(&project_dir) {
+            return picked;
+        }
+
+        let images_dir = project_dir.join("assets").join("images");
+        if let Err(err) = std::fs::create_dir_all(&images_dir) {
+            eprintln!("failed to create {}: {err}", images_dir.display());
+            return picked;
+        }
+
+        let Ok(source_bytes) = std::fs::read(&picked) else {
+            eprintln!("failed to read picked avatar {}", picked.display());
+            return picked;
+        };
+
+        let stem = picked.file_stem().and_then(|s| s.to_str()).unwrap_or("avatar");
+        let extension = picked.extension().and_then(|e| e.to_str()).unwrap_or("png");
+
+        let mut candidate = images_dir.join(format!("{stem}.{extension}"));
+        let mut counter = 2;
+        while candidate.exists() {
+            // Same bytes already imported under this name — reuse it.
+            if std::fs::read(&candidate).is_ok_and(|existing| existing == source_bytes) {
+                return candidate;
+            }
+            candidate = images_dir.join(format!("{stem}-{counter}.{extension}"));
+            counter += 1;
+        }
+
+        match std::fs::write(&candidate, &source_bytes) {
+            Ok(()) => candidate,
+            Err(err) => {
+                eprintln!("failed to import avatar to {}: {err}", candidate.display());
+                picked
+            }
         }
     }
 
@@ -428,7 +481,7 @@ impl cosmic::Application for AppModel {
             config,
             config_handle,
             popup: None,
-            save_dialog: None,
+            new_project_dialog: None,
             saved_toast: None,
             pending_exit_confirm: false,
             find_panel: None,
@@ -438,8 +491,13 @@ impl cosmic::Application for AppModel {
         // Push the loaded Preferences into the pages that mirror them.
         app.sync_pref_pages();
 
-        if app.config.reopen_last_project {
-            app.auto_load_last_project();
+        // The app never runs project-less: reopen the last project when
+        // enabled, and if that leaves nothing open (fresh install, reopen
+        // turned off, or a remembered path that no longer loads), block on
+        // the New Project dialog until one is created or opened.
+        let project_open = app.config.reopen_last_project && app.auto_load_last_project();
+        if !project_open {
+            app.open_new_project_dialog(false);
         }
 
         // Create a startup command that sets the window title.
@@ -548,7 +606,7 @@ impl cosmic::Application for AppModel {
             Message::Popup(PopupMessage::Close) => {
                 self.popup = None;
             }
-            Message::SaveDialog(msg) => return self.handle_save_dialog(msg),
+            Message::NewProject(msg) => return self.handle_new_project_dialog(msg),
             Message::ToastTick => self.handle_toast_tick(),
 
             Message::HeaderAction(action_intent) => { match action_intent {
@@ -672,7 +730,16 @@ impl cosmic::Application for AppModel {
                 }
             }
 
-            Message::Characters(msg) => {
+            Message::Characters(mut msg) => {
+                // A freshly picked avatar image is imported into the
+                // project's `assets/images/` *now* (copy-on-pick), so the
+                // project is self-contained from the moment the image is
+                // chosen — the editor then only ever sees the imported,
+                // absolute path.
+                if let CharactersMessage::Editor(EditorMessage::AvatarPicked(Some(path))) = &mut msg {
+                    *path = self.import_avatar(std::mem::take(path));
+                }
+
                 if let Some(_character_id) = self.characters.update(msg) {
                     self.core_mut().nav_bar_set_toggled(false);
                     // See the matching note in `Message::Canvas` above.
@@ -784,10 +851,12 @@ impl cosmic::Application for AppModel {
                 self.pending_exit_confirm = false;
                 let save_task = self.save_project();
 
-                // Saving a brand-new project opens the name/location dialog
-                // instead of writing immediately — don't force an exit out
-                // from under that; the user can close again once it's done.
-                return if self.save_dialog.is_none() {
+                // A project always has a directory now (the New Project
+                // dialog fronts every one), so saving never needs to stop
+                // and ask where — save and exit in one go. The guard covers
+                // the should-be-unreachable pathless case, where
+                // `save_project` falls back to opening the dialog instead.
+                return if self.new_project_dialog.is_none() {
                     Task::batch([save_task, self.exit_app()])
                 } else {
                     save_task

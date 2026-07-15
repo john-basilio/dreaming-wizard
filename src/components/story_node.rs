@@ -18,6 +18,10 @@ use crate::fl;
 pub struct StoryNode {
     pub id: Uuid,
     pub position: NodePosition,
+    /// Fixed in-app (see `NodeSize::default`) and deliberately not
+    /// persisted — `#[serde(skip)]` also makes legacy project files'
+    /// stored size an ignored leftover.
+    #[serde(skip)]
     pub size: NodeSize,
     pub title: String,
     /// The passage's actual content, in reading order — see
@@ -35,11 +39,19 @@ pub struct NodePosition {
     pub y: f32
 }
 
-/// A node's footprint, in world-space units (i.e. at 1x zoom).
+/// A node's footprint, in world-space units (i.e. at 1x zoom). Every node
+/// shares the `Default` footprint — there's no resize UI, and the project
+/// files don't store one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSize {
     pub width: f32,
     pub height: f32,
+}
+
+impl Default for NodeSize {
+    fn default() -> Self {
+        Self { width: 200.0, height: 100.0 }
+    }
 }
 
 // Conversion impl, so we only need to use .into() when when using values
@@ -60,7 +72,7 @@ impl Default for StoryNode {
         Self {
             id: Uuid::new_v4(),
             position: NodePosition {x: 0.0, y:0.0},
-            size: NodeSize {width: 200.0, height: 100.0},
+            size: NodeSize::default(),
             title: fl!("node-default-title"),
             blocks: Vec::new(),
         }
